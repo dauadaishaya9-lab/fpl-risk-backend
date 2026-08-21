@@ -27,7 +27,8 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  if (req.url === "/api/sample") {
+  if (req.method === "GET" && req.url === "/api/sample") {
+    try {
       const response = await fetch(
         "https://fantasy.premierleague.com/api/leagues-classic/314/standings/"
       );
