@@ -6,7 +6,7 @@ const FPL_URL = "https://fantasy.premierleague.com/api/bootstrap-static/";
 const server = http.createServer(async (req, res) => {
   res.setHeader("Content-Type", "application/json");
   res.setHeader("Access-Control-Allow-Origin", "*");
-
+console.log("REQUEST:", req.method, req.url);
   if (req.method === "GET" && req.url === "/api/fpl") {
     try {
       const response = await fetch(FPL_URL);
