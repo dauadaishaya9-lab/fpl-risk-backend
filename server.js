@@ -36,6 +36,36 @@ const server = http.createServer(async (req, res) => {
       if (!response.ok) {
         throw new Error(`FPL standings returned ${response.status}`);
       }
+      if (req.method === "GET" && req.url === "/api/previous-gw") {
+  try {
+    const response = await fetch(FPL_URL);
+
+    if (!response.ok) {
+      throw new Error(`FPL API returned ${response.status}`);
+    }
+
+    const data = await response.json();
+
+    const completedEvents = data.events.filter(function (event) {
+      return event.finished === true;
+    });
+
+    const previousGameweek =
+      completedEvents[completedEvents.length - 1].id;
+
+    res.writeHead(200);
+    res.end(JSON.stringify({
+      previousGameweek: previousGameweek
+    }));
+  } catch (error) {
+    res.writeHead(502);
+    res.end(JSON.stringify({
+      error: "Could not determine previous gameweek"
+    }));
+  }
+
+  return;
+      }
 
       const data = await response.json();
 
