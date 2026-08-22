@@ -841,6 +841,86 @@ const server =
 
         return;
       }
+            // ==================================================
+      // USER FPL ENTRY / GLOBAL RANK
+      // ==================================================
+
+      if (
+        req.method === "GET" &&
+        req.url.startsWith("/api/entry/")
+      ) {
+
+        const entryId =
+          req.url.split("/api/entry/")[1]
+
+
+        // Validate FPL ID
+        if (
+          !entryId ||
+          !/^\d+$/.test(entryId)
+        ) {
+
+          sendJSON(
+            res,
+            400,
+            {
+              error:
+                "Invalid FPL ID"
+            }
+          )
+
+          return
+        }
+
+
+        try {
+
+          const data =
+            await fetchJSON(
+              `${ENTRY_URL}${entryId}/`
+            )
+
+
+          sendJSON(
+            res,
+            200,
+            {
+              id:
+                data.id,
+
+              playerName:
+                data.player_first_name +
+                " " +
+                data.player_last_name,
+
+              teamName:
+                data.name,
+
+              overallRank:
+                data.summary_overall_rank,
+
+              overallPoints:
+                data.summary_overall_points
+            }
+          )
+
+        } catch (error) {
+
+          sendJSON(
+            res,
+            502,
+            {
+              error:
+                "Could not fetch FPL entry",
+
+              details:
+                error.message
+            }
+          )
+        }
+
+        return
+      }
 
 
       // ==================================================
