@@ -10,7 +10,7 @@ const STANDINGS_URL =
 
 const SAMPLE_SIZE = 10;
 
-// How often we check whether a new GW has finished.
+// Check for a newly completed gameweek every 5 minutes.
 const REFRESH_INTERVAL = 5 * 60 * 1000;
 
 
@@ -59,13 +59,21 @@ const TIERS = [
 const cache = {
   latestGameweek: null,
   latestResult: null,
+
+  // Keep previous completed GWs available internally.
   previousResults: {},
-  refreshing: false
+
+  // Prevent two refresh jobs running together.
+  refreshing: false,
+
+  lastRefreshAttempt: null,
+  lastSuccessfulRefresh: null,
+  lastError: null
 };
 
 
 // ==================================================
-// JSON RESPONSE
+// RESPONSE HELPER
 // ==================================================
 
 function sendJSON(res, status, data) {
@@ -75,24 +83,46 @@ function sendJSON(res, status, data) {
 
 
 // ==================================================
-// GET FPL BOOTSTRAP
+// FETCH WITH TIMEOUT
 // ==================================================
 
-async function getFPLData() {
-  const response = await fetch(FPL_URL);
+async function fetchJSON(url, timeoutMs = 15000) {
+  const controller = new AbortController();
 
-  if (!response.ok) {
-    throw new Error(
-      `FPL API returned ${response.status}`
-    );
+  const timeout = setTimeout(() => {
+    controller.abort();
+  }, timeoutMs);
+
+  try {
+    const response = await fetch(url, {
+      signal: controller.signal
+    });
+
+    if (!response.ok) {
+      throw new Error(
+        `HTTP ${response.status}`
+      );
+    }
+
+    return await response.json();
+
+  } finally {
+    clearTimeout(timeout);
   }
-
-  return await response.json();
 }
 
 
 // ==================================================
-// FIND LATEST COMPLETED GW
+// GET CURRENT FPL DATA
+// ==================================================
+
+async function getFPLData() {
+  return await fetchJSON(FPL_URL);
+}
+
+
+// ==================================================
+// FIND LATEST COMPLETED GAMEWEEK
 // ==================================================
 
 function getLatestCompletedGameweek(data) {
@@ -116,23 +146,14 @@ function getLatestCompletedGameweek(data) {
 // ==================================================
 
 async function getStandingsPage(page) {
-  const response =
-    await fetch(
-      `${STANDINGS_URL}?page_standings=${page}`
-    );
-
-  if (!response.ok) {
-    throw new Error(
-      `Standings returned ${response.status}`
-    );
-  }
-
-  return await response.json();
+  return await fetchJSON(
+    `${STANDINGS_URL}?page_standings=${page}`
+  );
 }
 
 
 // ==================================================
-// GET MANAGERS FOR TIER
+// GET 10 MANAGERS FROM A RANK TIER
 // ==================================================
 
 async function getManagersForTier(tier) {
@@ -183,25 +204,16 @@ async function getManagersForTier(tier) {
 
 
 // ==================================================
-// GET MANAGER PICKS
+// GET ONE MANAGER'S GW PICKS
 // ==================================================
 
 async function getManagerPicks(
   managerId,
   gameweek
 ) {
-  const response =
-    await fetch(
-      `https://fantasy.premierleague.com/api/entry/${managerId}/event/${gameweek}/picks/`
-    );
-
-  if (!response.ok) {
-    throw new Error(
-      `Picks returned ${response.status}`
-    );
-  }
-
-  return await response.json();
+  return await fetchJSON(
+    `https://fantasy.premierleague.com/api/entry/${managerId}/event/${gameweek}/picks/`
+  );
 }
 
 
@@ -214,7 +226,7 @@ async function analyzeTier(
   gameweek
 ) {
   console.log(
-    `Starting tier ${tier.name}`
+    `Building tier ${tier.name}`
   );
 
   const managers =
@@ -228,15 +240,12 @@ async function analyzeTier(
 
 
   // --------------------------------------------------
-  // Sequential on purpose for now.
-  // We will optimize this after proving reliability.
+  // Controlled sequential fetching.
+  // This is intentional for the first production
+  // version to reduce API pressure.
   // --------------------------------------------------
 
   for (const manager of managers) {
-
-    console.log(
-      `Fetching rank ${manager.rank}, manager ${manager.entry}`
-    );
 
     try {
 
@@ -302,15 +311,13 @@ async function analyzeTier(
 
 
       // ----------------------------------------------
-      // TC
+      // TRIPLE CAPTAINCY
       // ----------------------------------------------
 
       if (tripleCaptain) {
 
         const playerId =
-          String(
-            tripleCaptain.element
-          );
+          String(tripleCaptain.element);
 
         tripleCaptaincy[playerId] =
           (tripleCaptaincy[playerId] || 0) + 1;
@@ -318,7 +325,7 @@ async function analyzeTier(
 
 
       // ----------------------------------------------
-      // STORE MANAGER
+      // STORE MANAGER DATA
       // ----------------------------------------------
 
       results.push({
@@ -352,7 +359,6 @@ async function analyzeTier(
             : null,
 
         picks
-
       });
 
     } catch (error) {
@@ -372,7 +378,6 @@ async function analyzeTier(
 
         error:
           error.message
-
       });
     }
   }
@@ -393,70 +398,62 @@ async function analyzeTier(
 
 
   // ==================================================
-  // OWNERSHIP %
+  // PERCENTAGES
   // ==================================================
 
   const ownershipPercent = {};
-
-  for (
-    const [playerId, count]
-    of Object.entries(ownership)
-  ) {
-
-    ownershipPercent[playerId] =
-      Number(
-        (
-          count /
-          sampleSize *
-          100
-        ).toFixed(1)
-      );
-  }
-
-
-  // ==================================================
-  // CAPTAINCY %
-  // ==================================================
-
   const captaincyPercent = {};
-
-  for (
-    const [playerId, count]
-    of Object.entries(captaincy)
-  ) {
-
-    captaincyPercent[playerId] =
-      Number(
-        (
-          count /
-          sampleSize *
-          100
-        ).toFixed(1)
-      );
-  }
-
-
-  // ==================================================
-  // TC %
-  // ==================================================
-
   const tripleCaptainPercent = {};
 
-  for (
-    const [playerId, count]
-    of Object.entries(
-      tripleCaptaincy
-    )
-  ) {
 
-    tripleCaptainPercent[playerId] =
-      Number(
-        (
-          count /
-          sampleSize *
-          100
-        ).toFixed(1)
-      );
+  if (sampleSize > 0) {
+
+    for (
+      const [playerId, count]
+      of Object.entries(ownership)
+    ) {
+
+      ownershipPercent[playerId] =
+        Number(
+          (
+            count /
+            sampleSize *
+            100
+          ).toFixed(1)
+        );
+    }
+
+
+    for (
+      const [playerId, count]
+      of Object.entries(captaincy)
+    ) {
+
+      captaincyPercent[playerId] =
+        Number(
+          (
+            count /
+            sampleSize *
+            100
+          ).toFixed(1)
+        );
+    }
+
+
+    for (
+      const [playerId, count]
+      of Object.entries(tripleCaptaincy)
+    ) {
+
+      tripleCaptainPercent[playerId] =
+        Number(
+          (
+            count /
+            sampleSize *
+            100
+          ).toFixed(1)
+        );
+    }
   }
 
 
@@ -497,7 +494,7 @@ async function analyzeTier(
 
 
 // ==================================================
-// BUILD COMPLETE GW RESULT
+// BUILD COMPLETE GAMEWEEK RESULT
 // ==================================================
 
 async function buildGameweekResult(gameweek) {
@@ -516,6 +513,7 @@ async function buildGameweekResult(gameweek) {
 
 
   const tiers = [];
+
 
   for (const tier of TIERS) {
 
@@ -548,24 +546,37 @@ async function buildGameweekResult(gameweek) {
 
 
 // ==================================================
-// REFRESH CACHE
+// AUTOMATIC CACHE REFRESH
 // ==================================================
 
 async function refreshCache() {
 
-  // Prevent two refreshes happening at once.
   if (cache.refreshing) {
+
     console.log(
-      "Cache refresh already running."
+      "Refresh already running."
     );
 
     return;
   }
 
+
   cache.refreshing = true;
+
+  cache.lastRefreshAttempt =
+    new Date().toISOString();
 
 
   try {
+
+    // ----------------------------------------------
+    // STEP 1
+    // Check FPL for latest completed GW.
+    // ----------------------------------------------
+
+    console.log(
+      "Checking for completed gameweek..."
+    );
 
     const fplData =
       await getFPLData();
@@ -576,7 +587,7 @@ async function refreshCache() {
       );
 
 
-    if (!latestGameweek) {
+    if (latestGameweek === null) {
 
       console.log(
         "No completed gameweek yet."
@@ -587,7 +598,9 @@ async function refreshCache() {
 
 
     // ----------------------------------------------
-    // Already have this GW
+    // STEP 2
+    // Nothing new?
+    // Do absolutely nothing.
     // ----------------------------------------------
 
     if (
@@ -604,13 +617,19 @@ async function refreshCache() {
 
 
     // ----------------------------------------------
-    // New GW detected
+    // STEP 3
+    // NEW GAMEWEEK DETECTED.
     // ----------------------------------------------
 
     console.log(
-      `NEW COMPLETED GW DETECTED: ${latestGameweek}`
+      `NEW GAMEWEEK DETECTED: GW ${latestGameweek}`
     );
 
+
+    // ----------------------------------------------
+    // STEP 4
+    // Fetch and calculate everything ONCE.
+    // ----------------------------------------------
 
     const result =
       await buildGameweekResult(
@@ -618,7 +637,12 @@ async function refreshCache() {
       );
 
 
-    // Keep old result available.
+    // ----------------------------------------------
+    // STEP 5
+    // Only replace the live cache AFTER the
+    // entire GW has successfully finished building.
+    // ----------------------------------------------
+
     if (
       cache.latestGameweek !== null &&
       cache.latestResult !== null
@@ -631,12 +655,17 @@ async function refreshCache() {
     }
 
 
-    // Store new result.
     cache.latestGameweek =
       latestGameweek;
 
     cache.latestResult =
       result;
+
+    cache.lastSuccessfulRefresh =
+      new Date().toISOString();
+
+    cache.lastError =
+      null;
 
 
     console.log(
@@ -645,6 +674,9 @@ async function refreshCache() {
 
 
   } catch (error) {
+
+    cache.lastError =
+      error.message;
 
     console.error(
       "CACHE REFRESH FAILED:",
@@ -660,10 +692,16 @@ async function refreshCache() {
 
 
 // ==================================================
-// START AUTOMATIC REFRESH LOOP
+// START BACKGROUND REFRESH
 // ==================================================
 
+// This starts automatically when the server starts.
+// It does NOT wait for a user request.
+
 refreshCache();
+
+
+// Then periodically check whether a NEW GW exists.
 
 setInterval(
   refreshCache,
@@ -672,7 +710,7 @@ setInterval(
 
 
 // ==================================================
-// SERVER
+// HTTP SERVER
 // ==================================================
 
 const server =
@@ -703,13 +741,17 @@ const server =
           res,
           200,
           {
-            status: "ok",
+            status:
+              "ok",
 
             latestCompletedGameweek:
               cache.latestGameweek,
 
             cacheReady:
-              cache.latestResult !== null
+              cache.latestResult !== null,
+
+            refreshing:
+              cache.refreshing
           }
         );
 
@@ -743,146 +785,16 @@ const server =
         }
 
 
+        // ----------------------------------------------
+        // THIS DOES NOT FETCH FPL.
+        // IT ONLY RETURNS THE CACHE.
+        // ----------------------------------------------
+
         sendJSON(
           res,
           200,
           cache.latestResult
         );
-
-        return;
-      }
-
-
-      // ==================================================
-      // TEST SPECIFIC GW
-      //
-      // Example:
-      //
-      // /api/sample-tiers?gw=1
-      //
-      // This does NOT replace the automatic cache.
-      // It is only for testing.
-      // ==================================================
-
-      if (
-        req.method === "GET" &&
-        req.url.startsWith(
-          "/api/sample-tiers?gw="
-        )
-      ) {
-
-        const url =
-          new URL(
-            req.url,
-            "http://localhost"
-          );
-
-        const requestedGW =
-          Number(
-            url.searchParams.get(
-              "gw"
-            )
-          );
-
-
-        if (
-          !Number.isInteger(
-            requestedGW
-          ) ||
-          requestedGW < 1 ||
-          requestedGW > 38
-        ) {
-
-          sendJSON(
-            res,
-            400,
-            {
-              error:
-                "GW must be an integer from 1 to 38"
-            }
-          );
-
-          return;
-        }
-
-
-        try {
-
-          // If this GW is already cached,
-          // simply return it.
-
-          if (
-            cache.previousResults[
-              requestedGW
-            ]
-          ) {
-
-            sendJSON(
-              res,
-              200,
-              cache.previousResults[
-                requestedGW
-              ]
-            );
-
-            return;
-          }
-
-
-          if (
-            cache.latestGameweek ===
-            requestedGW
-          ) {
-
-            sendJSON(
-              res,
-              200,
-              cache.latestResult
-            );
-
-            return;
-          }
-
-
-          // Otherwise build it.
-          console.log(
-            `Manual test requested for GW ${requestedGW}`
-          );
-
-
-          const result =
-            await buildGameweekResult(
-              requestedGW
-            );
-
-
-          // Store it.
-          cache.previousResults[
-            requestedGW
-          ] =
-            result;
-
-
-          sendJSON(
-            res,
-            200,
-            result
-          );
-
-        } catch (error) {
-
-          sendJSON(
-            res,
-            500,
-            {
-              error:
-                "Could not build requested GW",
-
-              details:
-                error.message
-            }
-          );
-        }
 
         return;
       }
@@ -911,13 +823,19 @@ const server =
             refreshing:
               cache.refreshing,
 
+            lastRefreshAttempt:
+              cache.lastRefreshAttempt,
+
+            lastSuccessfulRefresh:
+              cache.lastSuccessfulRefresh,
+
+            lastError:
+              cache.lastError,
+
             storedHistoricalGameweeks:
               Object.keys(
                 cache.previousResults
-              ).map(
-                Number
-              )
-
+              ).map(Number)
           }
         );
 
@@ -927,6 +845,9 @@ const server =
 
       // ==================================================
       // RAW FPL DATA
+      //
+      // Kept for debugging only.
+      // The app should NOT use this endpoint.
       // ==================================================
 
       if (
@@ -956,6 +877,30 @@ const server =
             }
           );
         }
+
+        return;
+      }
+
+
+      // ==================================================
+      // OLD MANUAL TEST ROUTE
+      // ==================================================
+
+      if (
+        req.method === "GET" &&
+        req.url.startsWith(
+          "/api/sample-tiers?gw="
+        )
+      ) {
+
+        sendJSON(
+          res,
+          400,
+          {
+            error:
+              "Manual gameweek fetching is disabled. The backend now automatically fetches and caches the latest completed gameweek."
+          }
+        );
 
         return;
       }
