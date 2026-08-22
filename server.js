@@ -7,7 +7,7 @@ const FPL_URL =
 const server = http.createServer(async (req, res) => {
   res.setHeader("Content-Type", "application/json");
   res.setHeader("Access-Control-Allow-Origin", "*");
-
+console.log("REQUEST:", req.method, req.url);
   if (req.url === "/api/fpl") {
     try {
       const response = await fetch(FPL_URL);
