@@ -8,8 +8,7 @@ const server = http.createServer(async (req, res) => {
   res.setHeader("Content-Type", "application/json");
   res.setHeader("Access-Control-Allow-Origin", "*");
 
-  // Get FPL data
-  if (req.method === "GET" && req.url === "/api/fpl") {
+  if (req.url === "/api/fpl") {
     try {
       const response = await fetch(FPL_URL);
 
@@ -31,8 +30,7 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // Get 10 sample managers
-  if (req.method === "GET" && req.url === "/api/sample") {
+  if (req.url === "/api/sample") {
     try {
       const response = await fetch(
         "https://fantasy.premierleague.com/api/leagues-classic/314/standings/"
@@ -60,15 +58,12 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // Get previous completed gameweek
-  if (req.method === "GET" && req.url === "/api/previous-gw") {
+  if (req.url === "/api/previous-gw") {
     try {
       const response = await fetch(FPL_URL);
 
       if (!response.ok) {
-        throw new Error(
-          `FPL API returned ${response.status}`
-        );
+        throw new Error(`FPL API returned ${response.status}`);
       }
 
       const data = await response.json();
@@ -94,61 +89,12 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // Unknown route
   res.writeHead(404);
   res.end(JSON.stringify({
     error: "Not found"
   }));
 });
 
-server.listen(PORT, "0.0.0.0", () => {
-  console.log(`Server running on port ${PORT}`);
-});      error: "Could not determine previous gameweek"
-    }));
-  }
-
-  return;
-      }
-
-      const data = await response.json();
-
-      res.writeHead(200);
-      res.end(JSON.stringify(data.standings.results.slice(0, 10)));
-    } catch (error) {
-      res.writeHead(502);
-      res.end(JSON.stringify({ error: "Could not fetch standings" }));
-    }
-
-    return;
-  }
-
-  res.writeHead(404);
-  res.end(JSON.stringify({ error: "Not found" }));
-});
-
-server.listen(PORT, "0.0.0.0", () => {
-  console.log(`Server running on port ${PORT}`);
-});        throw new Error(`FPL standings returned ${response.status}`);
-      }
-
-      const data = await response.json();
-
-      console.log(data.standings.results.slice(0, 10));
-
-      res.writeHead(200);
-      res.end(JSON.stringify(data.standings.results.slice(0, 10)));
-    } catch (error) {
-      res.writeHead(502);
-      res.end(JSON.stringify({ error: "Could not fetch standings" }));
-    }
-
-    return;
-  }
-
-  res.writeHead(404);
-  res.end(JSON.stringify({ error: "Not found" }));
-});
-
-server.listen(PORT, "0.0.0.0", () => {
+server.listen(PORT, "0.0.0.0", function () {
   console.log(`Server running on port ${PORT}`);
 });
