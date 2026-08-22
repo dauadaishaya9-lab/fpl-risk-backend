@@ -7,8 +7,8 @@ const FPL_URL =
 const server = http.createServer(async (req, res) => {
   res.setHeader("Content-Type", "application/json");
   res.setHeader("Access-Control-Allow-Origin", "*");
-console.log("REQUEST URL:", JSON.stringify(req.url));
-  if (req.url === "/api/fpl") {
+
+  if (req.method === "GET" && req.url === "/api/fpl") {
     try {
       const response = await fetch(FPL_URL);
 
@@ -30,7 +30,7 @@ console.log("REQUEST URL:", JSON.stringify(req.url));
     return;
   }
 
-  if (req.url === "/api/sample") {
+  if (req.method === "GET" && req.url === "/api/sample") {
     try {
       const response = await fetch(
         "https://fantasy.premierleague.com/api/leagues-classic/314/standings/"
@@ -58,7 +58,7 @@ console.log("REQUEST URL:", JSON.stringify(req.url));
     return;
   }
 
-  if (req.url === "/api/previous-gw") {
+  if (req.method === "GET" && req.url === "/api/previous-gw") {
     try {
       const response = await fetch(FPL_URL);
 
@@ -68,16 +68,16 @@ console.log("REQUEST URL:", JSON.stringify(req.url));
 
       const data = await response.json();
 
-      const completedEvents = data.events.filter(function (event) {
-        return event.finished === true;
-      });
+      const completedEvents = data.events.filter(
+        (event) => event.finished === true
+      );
 
       const previousGameweek =
         completedEvents[completedEvents.length - 1].id;
 
       res.writeHead(200);
       res.end(JSON.stringify({
-        previousGameweek: previousGameweek
+        previousGameweek
       }));
     } catch (error) {
       res.writeHead(502);
@@ -95,6 +95,6 @@ console.log("REQUEST URL:", JSON.stringify(req.url));
   }));
 });
 
-server.listen(PORT, "0.0.0.0", function () {
+server.listen(PORT, "0.0.0.0", () => {
   console.log(`Server running on port ${PORT}`);
 });
