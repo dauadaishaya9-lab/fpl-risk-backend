@@ -10,6 +10,14 @@ const STANDINGS_URL =
 
 const SAMPLE_SIZE = 10;
 
+// How often we check whether a new GW has finished.
+const REFRESH_INTERVAL = 5 * 60 * 1000;
+
+
+// ==================================================
+// RANK TIERS
+// ==================================================
+
 const TIERS = [
   {
     name: "1-100",
@@ -45,7 +53,19 @@ const TIERS = [
 
 
 // ==================================================
-// SEND JSON
+// CACHE
+// ==================================================
+
+const cache = {
+  latestGameweek: null,
+  latestResult: null,
+  previousResults: {},
+  refreshing: false
+};
+
+
+// ==================================================
+// JSON RESPONSE
 // ==================================================
 
 function sendJSON(res, status, data) {
@@ -55,7 +75,7 @@ function sendJSON(res, status, data) {
 
 
 // ==================================================
-// GET FPL BOOTSTRAP DATA
+// GET FPL BOOTSTRAP
 // ==================================================
 
 async function getFPLData() {
@@ -72,7 +92,7 @@ async function getFPLData() {
 
 
 // ==================================================
-// FIND LATEST COMPLETED GAMEWEEK
+// FIND LATEST COMPLETED GW
 // ==================================================
 
 function getLatestCompletedGameweek(data) {
@@ -112,22 +132,13 @@ async function getStandingsPage(page) {
 
 
 // ==================================================
-// GET 10 MANAGERS FOR A TIER
+// GET MANAGERS FOR TIER
 // ==================================================
 
 async function getManagersForTier(tier) {
-
   const eligible = [];
 
   let page = 1;
-
-  /*
-    We fetch standings pages until we have
-    enough managers for the requested tier.
-
-    We keep this sequential for now because
-    we're testing the machinery first.
-  */
 
   while (eligible.length < SAMPLE_SIZE) {
 
@@ -157,27 +168,12 @@ async function getManagersForTier(tier) {
       }
     }
 
-    /*
-      If the page contains fewer than 50
-      managers, there are no more pages.
-    */
-
     if (managers.length < 50) {
       break;
     }
 
     page++;
   }
-
-  /*
-    IMPORTANT:
-
-    At this stage we're taking the first
-    10 managers found in the tier.
-
-    We will improve the sampling method
-    after we prove the API machinery works.
-  */
 
   return eligible.slice(
     0,
@@ -187,14 +183,13 @@ async function getManagersForTier(tier) {
 
 
 // ==================================================
-// GET MANAGER GW PICKS
+// GET MANAGER PICKS
 // ==================================================
 
 async function getManagerPicks(
   managerId,
   gameweek
 ) {
-
   const response =
     await fetch(
       `https://fantasy.premierleague.com/api/entry/${managerId}/event/${gameweek}/picks/`
@@ -218,6 +213,9 @@ async function analyzeTier(
   tier,
   gameweek
 ) {
+  console.log(
+    `Starting tier ${tier.name}`
+  );
 
   const managers =
     await getManagersForTier(tier);
@@ -225,15 +223,14 @@ async function analyzeTier(
   const results = [];
 
   const ownership = {};
-
   const captaincy = {};
-
   const tripleCaptaincy = {};
 
 
-  // ==================================================
-  // FETCH MANAGERS
-  // ==================================================
+  // --------------------------------------------------
+  // Sequential on purpose for now.
+  // We will optimize this after proving reliability.
+  // --------------------------------------------------
 
   for (const manager of managers) {
 
@@ -277,7 +274,7 @@ async function analyzeTier(
 
 
       // ----------------------------------------------
-      // PLAYER OWNERSHIP
+      // OWNERSHIP
       // ----------------------------------------------
 
       for (const pick of picks) {
@@ -305,7 +302,7 @@ async function analyzeTier(
 
 
       // ----------------------------------------------
-      // TRIPLE CAPTAINCY
+      // TC
       // ----------------------------------------------
 
       if (tripleCaptain) {
@@ -321,7 +318,7 @@ async function analyzeTier(
 
 
       // ----------------------------------------------
-      // SAVE MANAGER
+      // STORE MANAGER
       // ----------------------------------------------
 
       results.push({
@@ -355,12 +352,13 @@ async function analyzeTier(
             : null,
 
         picks
+
       });
 
     } catch (error) {
 
       console.error(
-        `Failed manager ${manager.entry}:`,
+        `Manager ${manager.entry} failed:`,
         error.message
       );
 
@@ -374,13 +372,14 @@ async function analyzeTier(
 
         error:
           error.message
+
       });
     }
   }
 
 
   // ==================================================
-  // SUCCESSFUL SAMPLE SIZE
+  // SUCCESSFUL MANAGERS
   // ==================================================
 
   const successfulManagers =
@@ -399,22 +398,19 @@ async function analyzeTier(
 
   const ownershipPercent = {};
 
-  if (sampleSize > 0) {
+  for (
+    const [playerId, count]
+    of Object.entries(ownership)
+  ) {
 
-    for (
-      const [playerId, count]
-      of Object.entries(ownership)
-    ) {
-
-      ownershipPercent[playerId] =
-        Number(
-          (
-            count /
-            sampleSize *
-            100
-          ).toFixed(1)
-        );
-    }
+    ownershipPercent[playerId] =
+      Number(
+        (
+          count /
+          sampleSize *
+          100
+        ).toFixed(1)
+      );
   }
 
 
@@ -424,22 +420,19 @@ async function analyzeTier(
 
   const captaincyPercent = {};
 
-  if (sampleSize > 0) {
+  for (
+    const [playerId, count]
+    of Object.entries(captaincy)
+  ) {
 
-    for (
-      const [playerId, count]
-      of Object.entries(captaincy)
-    ) {
-
-      captaincyPercent[playerId] =
-        Number(
-          (
-            count /
-            sampleSize *
-            100
-          ).toFixed(1)
-        );
-    }
+    captaincyPercent[playerId] =
+      Number(
+        (
+          count /
+          sampleSize *
+          100
+        ).toFixed(1)
+      );
   }
 
 
@@ -449,24 +442,21 @@ async function analyzeTier(
 
   const tripleCaptainPercent = {};
 
-  if (sampleSize > 0) {
+  for (
+    const [playerId, count]
+    of Object.entries(
+      tripleCaptaincy
+    )
+  ) {
 
-    for (
-      const [playerId, count]
-      of Object.entries(
-        tripleCaptaincy
-      )
-    ) {
-
-      tripleCaptainPercent[playerId] =
-        Number(
-          (
-            count /
-            sampleSize *
-            100
-          ).toFixed(1)
-        );
-    }
+    tripleCaptainPercent[playerId] =
+      Number(
+        (
+          count /
+          sampleSize *
+          100
+        ).toFixed(1)
+      );
   }
 
 
@@ -495,18 +485,190 @@ async function analyzeTier(
       results,
 
     ownership,
-
     ownershipPercent,
 
     captaincy,
-
     captaincyPercent,
 
     tripleCaptaincy,
-
     tripleCaptainPercent
   };
 }
+
+
+// ==================================================
+// BUILD COMPLETE GW RESULT
+// ==================================================
+
+async function buildGameweekResult(gameweek) {
+
+  console.log(
+    `========================================`
+  );
+
+  console.log(
+    `BUILDING CACHE FOR GW ${gameweek}`
+  );
+
+  console.log(
+    `========================================`
+  );
+
+
+  const tiers = [];
+
+  for (const tier of TIERS) {
+
+    const result =
+      await analyzeTier(
+        tier,
+        gameweek
+      );
+
+    tiers.push(result);
+  }
+
+
+  return {
+
+    season:
+      "2026/27",
+
+    gameweek,
+
+    sampleSize:
+      SAMPLE_SIZE,
+
+    createdAt:
+      new Date().toISOString(),
+
+    tiers
+  };
+}
+
+
+// ==================================================
+// REFRESH CACHE
+// ==================================================
+
+async function refreshCache() {
+
+  // Prevent two refreshes happening at once.
+  if (cache.refreshing) {
+    console.log(
+      "Cache refresh already running."
+    );
+
+    return;
+  }
+
+  cache.refreshing = true;
+
+
+  try {
+
+    const fplData =
+      await getFPLData();
+
+    const latestGameweek =
+      getLatestCompletedGameweek(
+        fplData
+      );
+
+
+    if (!latestGameweek) {
+
+      console.log(
+        "No completed gameweek yet."
+      );
+
+      return;
+    }
+
+
+    // ----------------------------------------------
+    // Already have this GW
+    // ----------------------------------------------
+
+    if (
+      cache.latestGameweek ===
+      latestGameweek
+    ) {
+
+      console.log(
+        `GW ${latestGameweek} already cached.`
+      );
+
+      return;
+    }
+
+
+    // ----------------------------------------------
+    // New GW detected
+    // ----------------------------------------------
+
+    console.log(
+      `NEW COMPLETED GW DETECTED: ${latestGameweek}`
+    );
+
+
+    const result =
+      await buildGameweekResult(
+        latestGameweek
+      );
+
+
+    // Keep old result available.
+    if (
+      cache.latestGameweek !== null &&
+      cache.latestResult !== null
+    ) {
+
+      cache.previousResults[
+        cache.latestGameweek
+      ] =
+        cache.latestResult;
+    }
+
+
+    // Store new result.
+    cache.latestGameweek =
+      latestGameweek;
+
+    cache.latestResult =
+      result;
+
+
+    console.log(
+      `GW ${latestGameweek} CACHE READY`
+    );
+
+
+  } catch (error) {
+
+    console.error(
+      "CACHE REFRESH FAILED:",
+      error.message
+    );
+
+  } finally {
+
+    cache.refreshing =
+      false;
+  }
+}
+
+
+// ==================================================
+// START AUTOMATIC REFRESH LOOP
+// ==================================================
+
+refreshCache();
+
+setInterval(
+  refreshCache,
+  REFRESH_INTERVAL
+);
 
 
 // ==================================================
@@ -543,11 +705,219 @@ const server =
           {
             status: "ok",
 
-            message:
-              "FPL rank-tier backend is running",
+            latestCompletedGameweek:
+              cache.latestGameweek,
 
-            season:
-              "2026/27"
+            cacheReady:
+              cache.latestResult !== null
+          }
+        );
+
+        return;
+      }
+
+
+      // ==================================================
+      // LATEST CACHED RESULT
+      // ==================================================
+
+      if (
+        req.method === "GET" &&
+        req.url === "/api/sample-tiers"
+      ) {
+
+        if (
+          cache.latestResult === null
+        ) {
+
+          sendJSON(
+            res,
+            503,
+            {
+              error:
+                "No cached completed gameweek yet."
+            }
+          );
+
+          return;
+        }
+
+
+        sendJSON(
+          res,
+          200,
+          cache.latestResult
+        );
+
+        return;
+      }
+
+
+      // ==================================================
+      // TEST SPECIFIC GW
+      //
+      // Example:
+      //
+      // /api/sample-tiers?gw=1
+      //
+      // This does NOT replace the automatic cache.
+      // It is only for testing.
+      // ==================================================
+
+      if (
+        req.method === "GET" &&
+        req.url.startsWith(
+          "/api/sample-tiers?gw="
+        )
+      ) {
+
+        const url =
+          new URL(
+            req.url,
+            "http://localhost"
+          );
+
+        const requestedGW =
+          Number(
+            url.searchParams.get(
+              "gw"
+            )
+          );
+
+
+        if (
+          !Number.isInteger(
+            requestedGW
+          ) ||
+          requestedGW < 1 ||
+          requestedGW > 38
+        ) {
+
+          sendJSON(
+            res,
+            400,
+            {
+              error:
+                "GW must be an integer from 1 to 38"
+            }
+          );
+
+          return;
+        }
+
+
+        try {
+
+          // If this GW is already cached,
+          // simply return it.
+
+          if (
+            cache.previousResults[
+              requestedGW
+            ]
+          ) {
+
+            sendJSON(
+              res,
+              200,
+              cache.previousResults[
+                requestedGW
+              ]
+            );
+
+            return;
+          }
+
+
+          if (
+            cache.latestGameweek ===
+            requestedGW
+          ) {
+
+            sendJSON(
+              res,
+              200,
+              cache.latestResult
+            );
+
+            return;
+          }
+
+
+          // Otherwise build it.
+          console.log(
+            `Manual test requested for GW ${requestedGW}`
+          );
+
+
+          const result =
+            await buildGameweekResult(
+              requestedGW
+            );
+
+
+          // Store it.
+          cache.previousResults[
+            requestedGW
+          ] =
+            result;
+
+
+          sendJSON(
+            res,
+            200,
+            result
+          );
+
+        } catch (error) {
+
+          sendJSON(
+            res,
+            500,
+            {
+              error:
+                "Could not build requested GW",
+
+              details:
+                error.message
+            }
+          );
+        }
+
+        return;
+      }
+
+
+      // ==================================================
+      // CACHE STATUS
+      // ==================================================
+
+      if (
+        req.method === "GET" &&
+        req.url === "/api/cache"
+      ) {
+
+        sendJSON(
+          res,
+          200,
+          {
+
+            latestGameweek:
+              cache.latestGameweek,
+
+            cacheReady:
+              cache.latestResult !== null,
+
+            refreshing:
+              cache.refreshing,
+
+            storedHistoricalGameweeks:
+              Object.keys(
+                cache.previousResults
+              ).map(
+                Number
+              )
+
           }
         );
 
@@ -582,237 +952,6 @@ const server =
             502,
             {
               error:
-                error.message
-            }
-          );
-        }
-
-        return;
-      }
-
-
-      // ==================================================
-      // LATEST COMPLETED GAMEWEEK
-      // ==================================================
-
-      if (
-        req.method === "GET" &&
-        req.url === "/api/previous-gw"
-      ) {
-
-        try {
-
-          const data =
-            await getFPLData();
-
-          const gameweek =
-            getLatestCompletedGameweek(
-              data
-            );
-
-          if (!gameweek) {
-
-            sendJSON(
-              res,
-              404,
-              {
-                error:
-                  "No completed gameweek yet"
-              }
-            );
-
-            return;
-          }
-
-          sendJSON(
-            res,
-            200,
-            {
-              previousGameweek:
-                gameweek
-            }
-          );
-
-        } catch (error) {
-
-          sendJSON(
-            res,
-            502,
-            {
-              error:
-                error.message
-            }
-          );
-        }
-
-        return;
-      }
-
-
-      // ==================================================
-      // SAMPLE RANK TIERS
-      //
-      // /api/sample-tiers
-      //
-      // Automatically uses latest completed GW.
-      //
-      // /api/sample-tiers?gw=1
-      //
-      // Forces a specific GW for testing.
-      // ==================================================
-
-      if (
-        req.method === "GET" &&
-        req.url.startsWith(
-          "/api/sample-tiers"
-        )
-      ) {
-
-        try {
-
-          const url =
-            new URL(
-              req.url,
-              "http://localhost"
-            );
-
-
-          // --------------------------------------------
-          // GET FORCED GW
-          // --------------------------------------------
-
-          const gwParameter =
-            url.searchParams.get(
-              "gw"
-            );
-
-
-          let gameweek;
-
-
-          // --------------------------------------------
-          // USE FORCED GW
-          // --------------------------------------------
-
-          if (gwParameter !== null) {
-
-            gameweek =
-              Number(gwParameter);
-
-            if (
-              !Number.isInteger(gameweek) ||
-              gameweek < 1 ||
-              gameweek > 38
-            ) {
-
-              sendJSON(
-                res,
-                400,
-                {
-                  error:
-                    "GW must be an integer from 1 to 38"
-                }
-              );
-
-              return;
-            }
-
-          }
-
-          // --------------------------------------------
-          // OTHERWISE FIND COMPLETED GW
-          // --------------------------------------------
-
-          else {
-
-            const fplData =
-              await getFPLData();
-
-            gameweek =
-              getLatestCompletedGameweek(
-                fplData
-              );
-
-
-            if (!gameweek) {
-
-              sendJSON(
-                res,
-                400,
-                {
-                  error:
-                    "There is no completed gameweek yet. Use ?gw=1 to test a specific gameweek."
-                }
-              );
-
-              return;
-            }
-          }
-
-
-          // --------------------------------------------
-          // ANALYZE ALL TIERS
-          // --------------------------------------------
-
-          const tiers = [];
-
-
-          for (
-            const tier of TIERS
-          ) {
-
-            console.log(
-              `Starting tier ${tier.name}`
-            );
-
-            const result =
-              await analyzeTier(
-                tier,
-                gameweek
-              );
-
-            tiers.push(result);
-          }
-
-
-          // --------------------------------------------
-          // RESPONSE
-          // --------------------------------------------
-
-          sendJSON(
-            res,
-            200,
-            {
-
-              test:
-                gwParameter !== null,
-
-              season:
-                "2026/27",
-
-              gameweek,
-
-              sampleSize:
-                SAMPLE_SIZE,
-
-              tiers
-            }
-          );
-
-        } catch (error) {
-
-          console.error(
-            error
-          );
-
-          sendJSON(
-            res,
-            500,
-            {
-              error:
-                "Could not build rank-tier sample",
-
-              details:
                 error.message
             }
           );
