@@ -5,6 +5,9 @@ const PORT = process.env.PORT || 3000;
 const FPL_URL =
   "https://fantasy.premierleague.com/api/bootstrap-static/";
 
+const ENTRY_URL =
+  "https://fantasy.premierleague.com/api/entry/";
+
 const STANDINGS_URL =
   "https://fantasy.premierleague.com/api/leagues-classic/314/standings/";
 
