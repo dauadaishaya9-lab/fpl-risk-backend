@@ -580,14 +580,29 @@ async function refreshCache() {
     console.log(
       "Checking for completed gameweek..."
     );
+const fplData =
+  await getFPLData();
 
-    const fplData =
-      await getFPLData();
+const latestGameweek =
+  getLatestCompletedGameweek(
+    fplData
+  );
 
-    const latestGameweek =
-      getLatestCompletedGameweek(
-        fplData
-      );
+console.log(
+  "Latest completed GW:",
+  latestGameweek
+);
+
+console.log(
+  "Event status:",
+  fplData.events.map(event => ({
+    id: event.id,
+    finished: event.finished,
+    is_current: event.is_current,
+    is_next: event.is_next
+  }))
+);
+
 
 
     if (latestGameweek === null) {
