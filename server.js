@@ -21,39 +21,29 @@ const REFRESH_INTERVAL = 5 * 60 * 1000;
 // RANK TIERS
 // ==================================================
 
-const TIERS = [
-  {
-    name: "1-100",
-    min: 1,
-    max: 100
-  },
-  {
-    name: "101-1000",
-    min: 101,
-    max: 1000
-  },
-  {
-    name: "1001-10000",
-    min: 1001,
-    max: 10000
-  },
-  {
-    name: "10001-100000",
-    min: 10001,
-    max: 100000
-  },
-  {
-    name: "100001-1000000",
-    min: 100001,
-    max: 1000000
-  },
-  {
-    name: "1000001+",
-    min: 1000001,
-    max: Infinity
-  }
-];
+const SAMPLING_BANDS = [
+  { name: "1-10000", min: 1, max: 10000, sampleSize: 10 },
 
+  { name: "10001-50000", min: 10001, max: 50000, sampleSize: 15 },
+
+  { name: "50001-100000", min: 50001, max: 100000, sampleSize: 20 },
+
+  { name: "100001-250000", min: 100001, max: 250000, sampleSize: 25 },
+
+  { name: "250001-500000", min: 250001, max: 500000, sampleSize: 30 },
+
+  { name: "500001-1000000", min: 500001, max: 1000000, sampleSize: 35 },
+
+  { name: "1000001-2000000", min: 1000001, max: 2000000, sampleSize: 40 },
+
+  { name: "2000001-3000000", min: 2000001, max: 3000000, sampleSize: 45 },
+
+  { name: "3000001-4000000", min: 3000001, max: 4000000, sampleSize: 50 },
+
+  { name: "4000001-5000000", min: 4000001, max: 5000000, sampleSize: 55 },
+
+  { name: "5000001+", min: 5000001, max: Infinity, sampleSize: 60 }
+];
 
 // ==================================================
 // CACHE
