@@ -211,52 +211,49 @@ function getRandomRanksForBand(
 }
 // GET SAMPLE MANAGERS FOR BAND
 // ==================================================
-
 async function getSampleManagersForBand(
   band,
   totalManagers
 ) {
-
   const targetRanks =
     getRandomRanksForBand(
       band,
       totalManagers
     );
 
-  const managersById =
-    new Map();
+  const pages = new Set();
 
-
+  // Convert random ranks to unique standings pages
   for (const rank of targetRanks) {
+    pages.add(
+      getStandingsPageForRank(rank)
+    );
+  }
 
-    const page =
-      getStandingsPageForRank(rank);
+  const managersById = new Map();
 
+  // Fetch each standings page only once
+  for (const page of pages) {
     try {
-
       const data =
         await getStandingsPage(page);
 
       const managers =
         data.standings?.results || [];
 
+      const maxRank =
+        band.max === Infinity
+          ? totalManagers
+          : Math.min(
+              band.max,
+              totalManagers
+            );
 
       for (const manager of managers) {
-
-        const maxRank =
-          band.max === Infinity
-            ? totalManagers
-            : Math.min(
-                band.max,
-                totalManagers
-              );
-
-
         if (
           manager.rank >= band.min &&
           manager.rank <= maxRank
         ) {
-
           managersById.set(
             manager.entry,
             manager
@@ -265,14 +262,12 @@ async function getSampleManagersForBand(
       }
 
     } catch (error) {
-
       console.error(
         `Failed to fetch standings page ${page}:`,
         error.message
       );
     }
   }
-
 
   return [
     ...managersById.values()
@@ -281,7 +276,6 @@ async function getSampleManagersForBand(
     band.sampleSize
   );
 }
-
 
 // ==================================================
 // GET ONE MANAGER'S GW PICKS
