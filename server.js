@@ -11,7 +11,7 @@ const ENTRY_URL =
 const STANDINGS_URL =
   "https://fantasy.premierleague.com/api/leagues-classic/314/standings/";
 
-const SAMPLE_SIZE = 10;
+
 
 // Check for a newly completed gameweek every 5 minutes.
 const REFRESH_INTERVAL = 5 * 60 * 1000;
@@ -210,20 +210,29 @@ async function getManagerPicks(
 }
 
 
-// ==================================================
-// ANALYZE ONE TIER
+// ==================================================// ==================================================
+// ANALYZE ONE SAMPLING BAND
 // ==================================================
 
-async function analyzeTier(
-  tier,
-  gameweek
+async function analyzeBand(
+  band,
+  gameweek,
+  totalManagers
 ) {
+
   console.log(
-    `Building tier ${tier.name}`
+    `Building band ${band.name}`
+  );
+
+  console.log(
+    `Target sample size: ${band.sampleSize}`
   );
 
   const managers =
-    await getManagersForTier(tier);
+    await getSampleManagersForBand(
+      band,
+      totalManagers
+    );
 
   const results = [];
 
@@ -231,11 +240,8 @@ async function analyzeTier(
   const captaincy = {};
   const tripleCaptaincy = {};
 
-
   // --------------------------------------------------
-  // Controlled sequential fetching.
-  // This is intentional for the first production
-  // version to reduce API pressure.
+  // Fetch GW picks for sampled managers
   // --------------------------------------------------
 
   for (const manager of managers) {
@@ -318,7 +324,7 @@ async function analyzeTier(
 
 
       // ----------------------------------------------
-      // STORE MANAGER DATA
+      // STORE MANAGER
       // ----------------------------------------------
 
       results.push({
@@ -386,7 +392,7 @@ async function analyzeTier(
         Array.isArray(manager.picks)
     );
 
-  const sampleSize =
+  const successfulSampleSize =
     successfulManagers.length;
 
 
@@ -399,7 +405,7 @@ async function analyzeTier(
   const tripleCaptainPercent = {};
 
 
-  if (sampleSize > 0) {
+  if (successfulSampleSize > 0) {
 
     for (
       const [playerId, count]
@@ -410,7 +416,7 @@ async function analyzeTier(
         Number(
           (
             count /
-            sampleSize *
+            successfulSampleSize *
             100
           ).toFixed(1)
         );
@@ -426,7 +432,7 @@ async function analyzeTier(
         Number(
           (
             count /
-            sampleSize *
+            successfulSampleSize *
             100
           ).toFixed(1)
         );
@@ -442,7 +448,7 @@ async function analyzeTier(
         Number(
           (
             count /
-            sampleSize *
+            successfulSampleSize *
             100
           ).toFixed(1)
         );
@@ -450,26 +456,30 @@ async function analyzeTier(
   }
 
 
+  // ==================================================
+  // RETURN BAND DATA
+  // ==================================================
+
   return {
 
-    tier:
-      tier.name,
+    band:
+      band.name,
 
     rankRange: {
+
       min:
-        tier.min,
+        band.min,
 
       max:
-        tier.max === Infinity
+        band.max === Infinity
           ? null
-          : tier.max
+          : band.max
     },
 
     requestedSampleSize:
-      SAMPLE_SIZE,
+      band.sampleSize,
 
-    successfulSampleSize:
-      sampleSize,
+    successfulSampleSize,
 
     managers:
       results,
@@ -484,41 +494,82 @@ async function analyzeTier(
     tripleCaptainPercent
   };
 }
-
-
 // ==================================================
 // BUILD COMPLETE GAMEWEEK RESULT
+// ==================================================
+
+// ==================================================
+// BUILD COMPLETE MEGA CACHE FOR GAMEWEEK
 // ==================================================
 
 async function buildGameweekResult(gameweek) {
 
   console.log(
-    `========================================`
+    "========================================"
   );
 
   console.log(
-    `BUILDING CACHE FOR GW ${gameweek}`
+    `BUILDING MEGA CACHE FOR GW ${gameweek}`
   );
 
   console.log(
-    `========================================`
+    "========================================"
   );
 
 
-  const tiers = [];
+  // --------------------------------------------------
+  // Get current total number of FPL managers.
+  // --------------------------------------------------
+
+  const fplData =
+    await getFPLData();
+
+  const totalManagers =
+  Number(
+    fplData.total_players
+  );
 
 
-  for (const tier of TIERS) {
+  if (
+    !Number.isFinite(totalManagers) ||
+    totalManagers <= 0
+  ) {
 
-    const result =
-      await analyzeTier(
-        tier,
-        gameweek
-      );
-
-    tiers.push(result);
+    throw new Error(
+      "Could not determine total number of FPL managers."
+    );
   }
 
+
+  console.log(
+    "Total managers:",
+    totalManagers
+  );
+
+
+  // --------------------------------------------------
+  // Build every sampling band.
+  // --------------------------------------------------
+
+  const bands = [];
+
+
+  for (const band of SAMPLING_BANDS) {
+
+    const result =
+      await analyzeBand(
+        band,
+        gameweek,
+        totalManagers
+      );
+
+    bands.push(result);
+  }
+
+
+  // --------------------------------------------------
+  // Return complete mega cache.
+  // --------------------------------------------------
 
   return {
 
@@ -527,17 +578,14 @@ async function buildGameweekResult(gameweek) {
 
     gameweek,
 
-    sampleSize:
-      SAMPLE_SIZE,
+    totalManagers,
+
+    bands,
 
     createdAt:
-      new Date().toISOString(),
-
-    tiers
+      new Date().toISOString()
   };
 }
-
-
 // ==================================================
 // AUTOMATIC CACHE REFRESH
 // ==================================================
