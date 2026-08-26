@@ -148,50 +148,77 @@ async function getStandingsPage(page) {
 // ==================================================
 // GET 10 MANAGERS FROM A RANK TIER
 // ==================================================
+// ==================================================
+// GET SAMPLE MANAGERS FOR BAND
+// ==================================================
 
-async function getManagersForTier(tier) {
-  const eligible = [];
+async function getSampleManagersForBand(
+  band,
+  totalManagers
+) {
 
-  let page = 1;
+  const targetRanks =
+    getRandomRanksForBand(
+      band,
+      totalManagers
+    );
 
-  while (eligible.length < SAMPLE_SIZE) {
+  const managersById =
+    new Map();
 
-    const data =
-      await getStandingsPage(page);
 
-    const managers =
-      data.standings.results;
+  for (const rank of targetRanks) {
 
-    if (managers.length === 0) {
-      break;
-    }
+    const page =
+      getStandingsPageForRank(rank);
 
-    for (const manager of managers) {
+    try {
 
-      if (
-        manager.rank >= tier.min &&
-        manager.rank <= tier.max
-      ) {
-        eligible.push(manager);
+      const data =
+        await getStandingsPage(page);
+
+      const managers =
+        data.standings?.results || [];
+
+
+      for (const manager of managers) {
+
+        const maxRank =
+          band.max === Infinity
+            ? totalManagers
+            : Math.min(
+                band.max,
+                totalManagers
+              );
+
+
+        if (
+          manager.rank >= band.min &&
+          manager.rank <= maxRank
+        ) {
+
+          managersById.set(
+            manager.entry,
+            manager
+          );
+        }
       }
 
-      if (
-        eligible.length >= SAMPLE_SIZE
-      ) {
-        break;
-      }
-    }
+    } catch (error) {
 
-    if (managers.length < 50) {
-      break;
+      console.error(
+        `Failed to fetch standings page ${page}:`,
+        error.message
+      );
     }
-
-    page++;
   }
 
-  return eligible.slice(
+
+  return [
+    ...managersById.values()
+  ].slice(
     0,
-    SAMPLE_SIZE
+    band.sampleSize
   );
 }
 
