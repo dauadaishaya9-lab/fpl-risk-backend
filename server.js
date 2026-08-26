@@ -149,6 +149,66 @@ async function getStandingsPage(page) {
 // GET 10 MANAGERS FROM A RANK TIER
 // ==================================================
 // ==================================================
+// ==================================================
+// FIND STANDINGS PAGE FOR A RANK
+// ==================================================
+
+function getStandingsPageForRank(rank) {
+  return Math.ceil(rank / 50);
+}
+// ==================================================
+// RANDOM INTEGER
+// ==================================================
+
+function randomInteger(min, max) {
+  return Math.floor(
+    Math.random() * (max - min + 1)
+  ) + min;
+}
+// ==================================================
+// GENERATE RANDOM TARGET RANKS
+// ==================================================
+
+function getRandomRanksForBand(
+  band,
+  totalManagers
+) {
+
+  const actualMax =
+    band.max === Infinity
+      ? totalManagers
+      : Math.min(
+          band.max,
+          totalManagers
+        );
+
+  if (band.min > actualMax) {
+    return [];
+  }
+
+  const availableManagers =
+    actualMax - band.min + 1;
+
+  const targetCount =
+    Math.min(
+      band.sampleSize,
+      availableManagers
+    );
+
+  const ranks = new Set();
+
+  while (ranks.size < targetCount) {
+
+    ranks.add(
+      randomInteger(
+        band.min,
+        actualMax
+      )
+    );
+  }
+
+  return [...ranks];
+}
 // GET SAMPLE MANAGERS FOR BAND
 // ==================================================
 
