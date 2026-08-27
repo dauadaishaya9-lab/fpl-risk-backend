@@ -16,9 +16,6 @@ const STANDINGS_URL =
 const REFRESH_INTERVAL = 5 * 60 * 1000;
 const LOCK_HOURS_BEFORE_DEADLINE = 1;
 const FPL_CACHE_TTL = 2 * 60 * 1000;
-const RATE_LIMIT_WINDOW = 60 * 1000;
-const RATE_LIMIT_MAX_REQUESTS = 60;
-const rateLimitStore = new Map();
 
 const SAMPLING_BANDS = [
   { name: "1-10000", min: 1, max: 10000, sampleSize: 10 },
@@ -60,38 +57,10 @@ function getSeasonLabel(date = new Date()) {
   return `${year}/${String(year + 1).slice(-2)}`;
 }
 
-function getClientIp(req) {
-  const forwarded = req.headers["x-forwarded-for"];
-  if (typeof forwarded === "string" && forwarded.length) {
-    return forwarded.split(",")[0].trim();
-  }
-  return req.socket.remoteAddress || "unknown";
-}
-
-function isRateLimited(req) {
-  const ip = getClientIp(req);
-  const now = Date.now();
-  const existing = rateLimitStore.get(ip);
-  if (!existing || now - existing.startedAt >= RATE_LIMIT_WINDOW) {
-    rateLimitStore.set(ip, { startedAt: now, count: 1 });
-    return false;
-  }
-  existing.count += 1;
-  return existing.count > RATE_LIMIT_MAX_REQUESTS;
-}
-
-setInterval(() => {
-  const cutoff = Date.now() - RATE_LIMIT_WINDOW;
-  for (const [ip, entry] of rateLimitStore) {
-    if (entry.startedAt < cutoff) rateLimitStore.delete(ip);
-  }
-}, RATE_LIMIT_WINDOW).unref();
-
 function sendJSON(res, status, data, extraHeaders = {}) {
   res.writeHead(status, {
     "Content-Type": "application/json; charset=utf-8",
     "Cache-Control": "no-store",
-    "Access-Control-Allow-Origin": "*",
     ...extraHeaders
   });
   res.end(JSON.stringify(data));
@@ -617,25 +586,10 @@ async function refreshScheduler() {
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
 
-  if (req.method === "OPTIONS") {
-    res.writeHead(204, {
-      "Access-Control-Allow-Origin": "*",
-      "Access-Control-Allow-Methods": "GET,OPTIONS",
-      "Access-Control-Allow-Headers": "Content-Type"
-    });
-    res.end();
-    return;
-  }
-
+  // The security gateway is the public HTTP policy layer. This server is
+  // deliberately minimal and should only be reachable on loopback.
   if (req.method !== "GET") {
-    sendJSON(res, 405, { error: "Method not allowed" });
-    return;
-  }
-
-  if (url.pathname !== "/" && isRateLimited(req)) {
-    sendJSON(res, 429, {
-      error: "Too many requests. Please try again shortly."
-    }, { "Retry-After": "60" });
+    sendJSON(res, 405, { error: "Method not allowed" }, { Allow: "GET" });
     return;
   }
 
@@ -755,8 +709,9 @@ async function start() {
     console.error("DATABASE_URL is missing. PostgreSQL persistence is disabled.");
   }
 
-  server.listen(PORT, "0.0.0.0", () => {
-    console.log(`Server running on port ${PORT}`);
+  // Loopback only: the security proxy owns the public listener.
+  server.listen(PORT, "127.0.0.1", () => {
+    console.log(`Internal backend running on loopback port ${PORT}`);
     console.log(`Sample lock policy: ${LOCK_HOURS_BEFORE_DEADLINE} hour before deadline.`);
     console.log(`FPL bootstrap cache TTL: ${FPL_CACHE_TTL / 1000}s.`);
   });
