@@ -169,30 +169,6 @@ function randomInteger(min, max) {
 // GENERATE RANDOM TARGET RANKS
 // ==================================================
 
-
-  const availableManagers =
-    actualMax - band.min + 1;
-
-  const targetCount =
-    Math.min(
-      band.sampleSize,
-      availableManagers
-    );
-
-  const ranks = new Set();
-
-  while (ranks.size < targetCount) {
-
-    ranks.add(
-      randomInteger(
-        band.min,
-        actualMax
-      )
-    );
-  }
-
-
-// ==================================================
 // GET RANDOM SAMPLE MANAGERS FOR BAND
 // ==================================================
 
