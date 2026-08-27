@@ -1,4 +1,5 @@
 import http from "node:http";
+import net from "node:net";
 import crypto from "node:crypto";
 import pg from "pg";
 
@@ -12,9 +13,9 @@ const FRONTEND_ORIGINS = (process.env.FRONTEND_ORIGINS || "http://localhost:5173
   .split(",")
   .map(value => value.trim())
   .filter(Boolean);
-const CLERK_JWT_KEY = process.env.CLERK_JWT_KEY;
+const CLERK_JWT_KEY = (process.env.CLERK_JWT_KEY || "").replace(/\\n/g, "\n");
 const CLERK_ISSUER = process.env.CLERK_ISSUER;
-const CLERK_AUTHORIZED_PARTIES = (process.env.CLERK_AUTHORIZED_PARTIES || FRONTEND_ORIGINS.join(","))
+const CLERK_AUTHORIZED_PARTIES = (process.env.CLERK_AUTHORIZED_PARTIES || "")
   .split(",")
   .map(value => value.trim())
   .filter(Boolean);
@@ -23,8 +24,11 @@ const WINDOW_MS = 60_000;
 const IP_LIMIT = 60;
 const USER_LIMIT = 120;
 const TRIAL_LIMIT = 3;
+const MAX_BUCKETS = 10_000;
+const MAX_JWT_LENGTH = 16_384;
 const ipBuckets = new Map();
 const userBuckets = new Map();
+let backendReady = false;
 
 const pool = DATABASE_URL
   ? new Pool({
@@ -50,8 +54,8 @@ function json(res, status, data, headers = {}) {
 }
 
 function clientIp(req) {
-  // Render supplies the client address in X-Forwarded-For. The gateway is the
-  // only public service, so this value is used for abuse throttling, not auth.
+  // Render supplies the client address in X-Forwarded-For. This value is only
+  // used for throttling; authentication never trusts client-supplied identity.
   const forwarded = req.headers["x-forwarded-for"];
   if (typeof forwarded === "string" && forwarded.trim()) {
     return forwarded.split(",")[0].trim();
@@ -63,6 +67,10 @@ function bucketLimited(store, key, limit) {
   const now = Date.now();
   const current = store.get(key);
   if (!current || now - current.startedAt >= WINDOW_MS) {
+    if (store.size >= MAX_BUCKETS) {
+      const oldestKey = store.keys().next().value;
+      if (oldestKey !== undefined) store.delete(oldestKey);
+    }
     store.set(key, { startedAt: now, count: 1 });
     return false;
   }
@@ -96,7 +104,13 @@ function getToken(req) {
 
   const cookie = req.headers.cookie || "";
   const match = cookie.match(/(?:^|;\s*)__session=([^;]+)/);
-  return match ? decodeURIComponent(match[1]) : null;
+  if (!match) return null;
+
+  try {
+    return decodeURIComponent(match[1]);
+  } catch {
+    return null;
+  }
 }
 
 function verifyClerkToken(req) {
@@ -106,6 +120,9 @@ function verifyClerkToken(req) {
 
   const token = getToken(req);
   if (!token) return { ok: false, status: 401, error: "Authentication required." };
+  if (token.length > MAX_JWT_LENGTH) {
+    return { ok: false, status: 401, error: "Invalid authentication token." };
+  }
 
   try {
     const parts = token.split(".");
@@ -159,9 +176,8 @@ async function initSecurityDatabase() {
 async function getCurrentGameweekAndDeadline() {
   if (!pool) throw new Error("Database is required for usage enforcement.");
 
-  // The next FPL deadline defines the current trial period. Before GW1's
-  // deadline this selects GW1; immediately after that deadline it selects GW2,
-  // so the three-use quota resets at the real FPL deadline automatically.
+  // The next FPL deadline defines the current trial period. Before a deadline
+  // this selects that GW; immediately after it, the next GW becomes active.
   const upcoming = await pool.query(`
     SELECT gameweek, deadline
     FROM fpl_gameweeks
@@ -177,8 +193,7 @@ async function getCurrentGameweekAndDeadline() {
     };
   }
 
-  // If the schedule has no future deadline (for example at season end), fail
-  // closed rather than accidentally reusing an old gameweek's quota.
+  // At season end, fail closed rather than accidentally reusing an old quota.
   throw new Error("No upcoming FPL deadline is available.");
 }
 
@@ -320,10 +335,11 @@ const gateway = http.createServer(async (req, res) => {
   }
 
   if (url.pathname === "/health" || url.pathname === "/") {
-    json(res, 200, {
-      status: "ok",
+    json(res, backendReady ? 200 : 503, {
+      status: backendReady ? "ok" : "starting",
       securityGateway: true,
-      authentication: Boolean(CLERK_JWT_KEY && CLERK_ISSUER)
+      backendReady,
+      authentication: Boolean(CLERK_JWT_KEY && CLERK_ISSUER && CLERK_AUTHORIZED_PARTIES.length)
     });
     return;
   }
@@ -338,6 +354,11 @@ const gateway = http.createServer(async (req, res) => {
     return;
   }
 
+  if (!backendReady) {
+    json(res, 503, { error: "Backend is starting. Please retry shortly." }, { "Retry-After": "3" });
+    return;
+  }
+
   const auth = verifyClerkToken(req);
   if (!auth.ok) {
     json(res, auth.status, { error: auth.error });
@@ -349,8 +370,6 @@ const gateway = http.createServer(async (req, res) => {
     return;
   }
 
-  // Operational cache/scheduler details are intentionally not part of the
-  // public API surface. The FPL data endpoint is the supported client API.
   if (url.pathname === "/api/cache") {
     json(res, 404, { error: "Not found" });
     return;
@@ -402,6 +421,38 @@ const gateway = http.createServer(async (req, res) => {
   }
 });
 
+function waitForInternalBackend(timeoutMs = 60_000) {
+  const startedAt = Date.now();
+
+  return new Promise((resolve, reject) => {
+    const attempt = () => {
+      const socket = net.createConnection({ host: "127.0.0.1", port: INTERNAL_PORT });
+      let settled = false;
+
+      const finish = (error) => {
+        if (settled) return;
+        settled = true;
+        socket.destroy();
+        if (!error) {
+          resolve();
+          return;
+        }
+        if (Date.now() - startedAt >= timeoutMs) {
+          reject(new Error(`Internal backend did not start within ${timeoutMs}ms.`));
+          return;
+        }
+        setTimeout(attempt, 250);
+      };
+
+      socket.once("connect", () => finish(null));
+      socket.once("error", finish);
+      socket.setTimeout(1_000, () => finish(new Error("Internal backend connection timed out.")));
+    };
+
+    attempt();
+  });
+}
+
 async function start() {
   if (!DATABASE_URL) {
     console.error("SECURITY STARTUP FAILED: DATABASE_URL is required for trial enforcement.");
@@ -417,6 +468,8 @@ async function start() {
 
   process.env.PORT = String(INTERNAL_PORT);
   await import("./server.js");
+  await waitForInternalBackend();
+  backendReady = true;
 
   gateway.listen(PUBLIC_PORT, "0.0.0.0", () => {
     console.log(`Security gateway listening on port ${PUBLIC_PORT}`);
