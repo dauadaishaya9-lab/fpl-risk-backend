@@ -211,6 +211,14 @@ function getRandomRanksForBand(
 }
 // GET SAMPLE MANAGERS FOR BAND
 // ==================================================
+// ==================================================
+// GET SAMPLE MANAGERS FOR BAND
+// ==================================================
+
+// ==================================================
+// GET SAMPLE MANAGERS FOR BAND
+// ==================================================
+
 async function getSampleManagersForBand(
   band,
   totalManagers
@@ -223,7 +231,7 @@ async function getSampleManagersForBand(
 
   const pages = new Set();
 
-  // Convert random ranks to unique standings pages
+  // Convert random ranks into unique standings pages
   for (const rank of targetRanks) {
     pages.add(
       getStandingsPageForRank(rank)
@@ -232,7 +240,7 @@ async function getSampleManagersForBand(
 
   const managersById = new Map();
 
-  // Fetch each standings page only once
+  // Fetch each required page only once
   for (const page of pages) {
 
     console.log(
@@ -244,9 +252,7 @@ async function getSampleManagersForBand(
       const data =
         await getStandingsPage(page);
 
-      console.log(
-        `Received standings page ${page}`
-      ); const managers =
+      const managers =
         data.standings?.results || [];
 
       const maxRank =
@@ -258,6 +264,7 @@ async function getSampleManagersForBand(
             );
 
       for (const manager of managers) {
+
         if (
           manager.rank >= band.min &&
           manager.rank <= maxRank
@@ -270,6 +277,7 @@ async function getSampleManagersForBand(
       }
 
     } catch (error) {
+
       console.error(
         `Failed to fetch standings page ${page}:`,
         error.message
@@ -277,15 +285,36 @@ async function getSampleManagersForBand(
     }
   }
 
-  return [
-    ...managersById.values()
-  ].slice(
+  // Convert to array and shuffle
+  const candidates =
+    [...managersById.values()];
+
+  for (
+    let i = candidates.length - 1;
+    i > 0;
+    i--
+  ) {
+
+    const j =
+      Math.floor(
+        Math.random() * (i + 1)
+      );
+
+    [
+      candidates[i],
+      candidates[j]
+    ] = [
+      candidates[j],
+      candidates[i]
+    ];
+  }
+
+  // Return random managers from the tier
+  return candidates.slice(
     0,
     band.sampleSize
   );
-}
-
-// ==================================================
+} ==================================================
 // GET ONE MANAGER'S GW PICKS
 // ==================================================
 
