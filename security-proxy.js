@@ -51,7 +51,6 @@ function json(res, status, data, headers = {}) {
 }
 
 function clientIp(req) {
-  // Only trust X-Forwarded-For when your hosting platform is the trusted proxy.
   const forwarded = req.headers["x-forwarded-for"];
   return typeof forwarded === "string" && forwarded
     ? forwarded.split(",")[0].trim()
@@ -140,58 +139,80 @@ function verifyClerkToken(req) {
 async function initSecurityDatabase() {
   if (!pool) throw new Error("DATABASE_URL is not configured.");
   await pool.query(`
-    CREATE TABLE IF NOT EXISTS user_weekly_usage (
+    CREATE TABLE IF NOT EXISTS user_deadline_usage (
       user_id TEXT NOT NULL,
-      week_start DATE NOT NULL,
+      gameweek INTEGER NOT NULL,
+      deadline_at TIMESTAMPTZ NOT NULL,
       calculation_count INTEGER NOT NULL DEFAULT 0,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      PRIMARY KEY (user_id, week_start),
-      CONSTRAINT user_weekly_usage_count_nonnegative CHECK (calculation_count >= 0)
+      PRIMARY KEY (user_id, gameweek),
+      CONSTRAINT user_deadline_usage_count_nonnegative CHECK (calculation_count >= 0)
     );
-    CREATE INDEX IF NOT EXISTS idx_user_weekly_usage_week
-      ON user_weekly_usage(week_start);
+    CREATE INDEX IF NOT EXISTS idx_user_deadline_usage_deadline
+      ON user_deadline_usage(deadline_at);
   `);
+}
+
+function getCurrentGameweekAndDeadline() {
+  const rawGameweek = Number(process.env.FPL_CURRENT_GAMEWEEK);
+  const rawDeadline = process.env.FPL_CURRENT_DEADLINE;
+  if (!Number.isInteger(rawGameweek) || rawGameweek < 1 || !rawDeadline) {
+    throw new Error("FPL_CURRENT_GAMEWEEK and FPL_CURRENT_DEADLINE must be configured.");
+  }
+  const deadline = new Date(rawDeadline);
+  if (Number.isNaN(deadline.getTime())) throw new Error("FPL_CURRENT_DEADLINE is invalid.");
+  return { gameweek: rawGameweek, deadline };
 }
 
 async function consumeTrial(userId) {
   if (!pool) throw new Error("Database is required for usage enforcement.");
 
+  const { gameweek, deadline } = getCurrentGameweekAndDeadline();
   const result = await pool.query(`
-    INSERT INTO user_weekly_usage (user_id, week_start, calculation_count)
-    VALUES ($1, date_trunc('week', CURRENT_DATE)::date, 1)
-    ON CONFLICT (user_id, week_start)
+    INSERT INTO user_deadline_usage (user_id, gameweek, deadline_at, calculation_count)
+    VALUES ($1, $2, $3, 1)
+    ON CONFLICT (user_id, gameweek)
     DO UPDATE SET
-      calculation_count = user_weekly_usage.calculation_count + 1,
+      calculation_count = user_deadline_usage.calculation_count + 1,
+      deadline_at = EXCLUDED.deadline_at,
       updated_at = NOW()
-    WHERE user_weekly_usage.calculation_count < $2
+    WHERE user_deadline_usage.calculation_count < $4
     RETURNING calculation_count
-  `, [userId, TRIAL_LIMIT]);
+  `, [userId, gameweek, deadline.toISOString(), TRIAL_LIMIT]);
 
   if (!result.rowCount) {
     const current = await pool.query(`
       SELECT calculation_count
-      FROM user_weekly_usage
-      WHERE user_id = $1 AND week_start = date_trunc('week', CURRENT_DATE)::date
-    `, [userId]);
+      FROM user_deadline_usage
+      WHERE user_id = $1 AND gameweek = $2
+    `, [userId, gameweek]);
     return {
       allowed: false,
       used: Number(current.rows[0]?.calculation_count || TRIAL_LIMIT),
-      remaining: 0
+      remaining: 0,
+      gameweek,
+      deadline
     };
   }
 
   const used = Number(result.rows[0].calculation_count);
-  return { allowed: true, used, remaining: Math.max(0, TRIAL_LIMIT - used) };
+  return {
+    allowed: true,
+    used,
+    remaining: Math.max(0, TRIAL_LIMIT - used),
+    gameweek,
+    deadline
+  };
 }
 
-async function refundTrial(userId) {
+async function refundTrial(userId, gameweek) {
   if (!pool) return;
   await pool.query(`
-    UPDATE user_weekly_usage
+    UPDATE user_deadline_usage
     SET calculation_count = GREATEST(calculation_count - 1, 0), updated_at = NOW()
-    WHERE user_id = $1 AND week_start = date_trunc('week', CURRENT_DATE)::date
-  `, [userId]);
+    WHERE user_id = $1 AND gameweek = $2
+  `, [userId, gameweek]);
 }
 
 function originAllowed(origin) {
@@ -291,8 +312,6 @@ const gateway = http.createServer(async (req, res) => {
     return;
   }
 
-  // Every request to the calculator data endpoint consumes one of the 3 weekly trials.
-  // This is enforced by user ID in PostgreSQL, not by the frontend or localStorage.
   const isCalculation = url.pathname === "/api/sample-tiers" || url.pathname === "/api/calculator/context";
   let trial = null;
 
@@ -304,13 +323,16 @@ const gateway = http.createServer(async (req, res) => {
     try {
       trial = await consumeTrial(auth.userId);
       if (!trial.allowed) {
+        const retryAfter = Math.max(1, Math.ceil((trial.deadline.getTime() - Date.now()) / 1000));
         json(res, 429, {
-          error: "Weekly trial limit reached.",
-          code: "WEEKLY_TRIAL_LIMIT",
+          error: "Gameweek trial limit reached. Trials reset after the FPL deadline.",
+          code: "GAMEWEEK_TRIAL_LIMIT",
           used: trial.used,
           remaining: 0,
-          limit: TRIAL_LIMIT
-        }, { "Retry-After": "604800" });
+          limit: TRIAL_LIMIT,
+          gameweek: trial.gameweek,
+          resetsAt: trial.deadline.toISOString()
+        }, { "Retry-After": String(retryAfter) });
         return;
       }
     } catch (error) {
@@ -321,16 +343,15 @@ const gateway = http.createServer(async (req, res) => {
   }
 
   try {
-    // Keep the legacy endpoint intact; expose the future-proof calculator route as an alias.
     if (url.pathname === "/api/calculator/context") {
       url.pathname = "/api/sample-tiers";
       req.url = `${url.pathname}${url.search}`;
     }
 
     const status = await proxy(req, res, auth.userId);
-    if (isCalculation && status >= 500) await refundTrial(auth.userId);
+    if (isCalculation && status >= 500) await refundTrial(auth.userId, trial.gameweek);
   } catch (error) {
-    if (isCalculation && trial?.allowed) await refundTrial(auth.userId);
+    if (isCalculation && trial?.allowed) await refundTrial(auth.userId, trial.gameweek);
     console.error("UPSTREAM PROXY ERROR:", error.message);
     if (!res.headersSent) json(res, 502, { error: "Backend service unavailable." });
     else res.end();
@@ -350,14 +371,13 @@ async function start() {
 
   await initSecurityDatabase();
 
-  // Start the existing application server on an unreachable loopback port.
   process.env.PORT = String(INTERNAL_PORT);
   await import("./server.js");
 
   gateway.listen(PUBLIC_PORT, "0.0.0.0", () => {
     console.log(`Security gateway listening on port ${PUBLIC_PORT}`);
     console.log(`Legacy backend isolated on loopback port ${INTERNAL_PORT}`);
-    console.log(`Free quota: ${TRIAL_LIMIT} calculator uses per UTC week.`);
+    console.log(`Free quota: ${TRIAL_LIMIT} calculator uses per FPL gameweek/deadline.`);
   });
 }
 
