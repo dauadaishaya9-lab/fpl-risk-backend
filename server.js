@@ -309,8 +309,19 @@ async function analyzeBand(
   // --------------------------------------------------
   // Fetch GW picks for sampled managers
   // --------------------------------------------------
+  // --------------------------------------------------
+  // Fetch GW picks for sampled managers
+  // --------------------------------------------------
+
+  console.log(
+    `Band ${band.name}: starting picks fetch for ${managers.length} managers`
+  );
 
   for (const manager of managers) {
+
+    console.log(
+      `Fetching picks for manager ${manager.entry}`
+    );
 
     try {
 
@@ -319,6 +330,8 @@ async function analyzeBand(
           manager.entry,
           gameweek
         );
+
+   
 
       const picks =
         picksData.picks || [];
@@ -446,6 +459,9 @@ async function analyzeBand(
       });
     }
   }
+  console.log(
+    `Band ${band.name}: FINISHED picks fetch`
+  );
 
 
   // ==================================================
