@@ -1,1 +1,52 @@
+<!DOCTYPE html>
+<html>
 
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>FPL RISK</title>
+</head>
+
+<body>
+
+  <h1>FPL RISK CALCULATOR</h1>
+
+  <label for="fpl-id">FPL ID</label>
+  <input type="number" id="fpl-id">
+
+  <button type="button" id="register">REGISTER</button>
+
+  <label for="player-search">Player:</label>
+  <input type="text" id="player-search" placeholder="Search player">
+
+<div id="player-options"></div>
+
+<p>Do you own this player?</p>
+
+<button type="button" id="own-yes">YES</button>
+<button type="button" id="own-no">NO</button>
+
+<p>Are you captaining this player?</p>
+
+<button type="button" id="cap-yes">YES</button>
+<button type="button" id="cap-no">NO</button>
+<p>Are you Triple Captaining this player?</p>
+
+<button type="button" id="tc-yes">YES</button>
+<button type="button" id="tc-no">NO</button>
+
+
+<div>
+<label for="points">Points:</label>
+<input type="number" id="points"/>
+</div>
+
+<button type="button" id="check-risk">
+  CHECK RISK</button>
+  <div id="risk-result"></div>
+
+  <script src="script.js"></script>
+
+</body>
+
+</html>
