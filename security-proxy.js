@@ -4,8 +4,7 @@ import pg from "pg";
 
 const { Pool } = pg;
 
-// Security gateway. The existing server runs privately behind this proxy.
-// Clerk session tokens are verified locally with CLERK_JWT_KEY.
+// Public security gateway. The FPL backend runs privately behind this proxy.
 const PUBLIC_PORT = Number(process.env.PORT || 3000);
 const INTERNAL_PORT = Number(process.env.INTERNAL_PORT || 3001);
 const DATABASE_URL = process.env.DATABASE_URL;
@@ -51,10 +50,13 @@ function json(res, status, data, headers = {}) {
 }
 
 function clientIp(req) {
+  // Render supplies the client address in X-Forwarded-For. The gateway is the
+  // only public service, so this value is used for abuse throttling, not auth.
   const forwarded = req.headers["x-forwarded-for"];
-  return typeof forwarded === "string" && forwarded
-    ? forwarded.split(",")[0].trim()
-    : req.socket.remoteAddress || "unknown";
+  if (typeof forwarded === "string" && forwarded.trim()) {
+    return forwarded.split(",")[0].trim();
+  }
+  return req.socket.remoteAddress || "unknown";
 }
 
 function bucketLimited(store, key, limit) {
@@ -154,21 +156,36 @@ async function initSecurityDatabase() {
   `);
 }
 
-function getCurrentGameweekAndDeadline() {
-  const rawGameweek = Number(process.env.FPL_CURRENT_GAMEWEEK);
-  const rawDeadline = process.env.FPL_CURRENT_DEADLINE;
-  if (!Number.isInteger(rawGameweek) || rawGameweek < 1 || !rawDeadline) {
-    throw new Error("FPL_CURRENT_GAMEWEEK and FPL_CURRENT_DEADLINE must be configured.");
+async function getCurrentGameweekAndDeadline() {
+  if (!pool) throw new Error("Database is required for usage enforcement.");
+
+  // The next FPL deadline defines the current trial period. Before GW1's
+  // deadline this selects GW1; immediately after that deadline it selects GW2,
+  // so the three-use quota resets at the real FPL deadline automatically.
+  const upcoming = await pool.query(`
+    SELECT gameweek, deadline
+    FROM fpl_gameweeks
+    WHERE deadline > NOW()
+    ORDER BY deadline ASC
+    LIMIT 1
+  `);
+
+  if (upcoming.rowCount) {
+    return {
+      gameweek: Number(upcoming.rows[0].gameweek),
+      deadline: new Date(upcoming.rows[0].deadline)
+    };
   }
-  const deadline = new Date(rawDeadline);
-  if (Number.isNaN(deadline.getTime())) throw new Error("FPL_CURRENT_DEADLINE is invalid.");
-  return { gameweek: rawGameweek, deadline };
+
+  // If the schedule has no future deadline (for example at season end), fail
+  // closed rather than accidentally reusing an old gameweek's quota.
+  throw new Error("No upcoming FPL deadline is available.");
 }
 
 async function consumeTrial(userId) {
   if (!pool) throw new Error("Database is required for usage enforcement.");
 
-  const { gameweek, deadline } = getCurrentGameweekAndDeadline();
+  const { gameweek, deadline } = await getCurrentGameweekAndDeadline();
   const result = await pool.query(`
     INSERT INTO user_deadline_usage (user_id, gameweek, deadline_at, calculation_count)
     VALUES ($1, $2, $3, 1)
@@ -231,7 +248,18 @@ function corsHeaders(origin) {
 }
 
 function copySafeHeaders(source, target) {
-  const blocked = new Set(["connection", "keep-alive", "transfer-encoding", "upgrade", "host"]);
+  const blocked = new Set([
+    "connection",
+    "keep-alive",
+    "transfer-encoding",
+    "upgrade",
+    "host",
+    "access-control-allow-origin",
+    "access-control-allow-credentials",
+    "access-control-allow-methods",
+    "access-control-allow-headers",
+    "access-control-expose-headers"
+  ]);
   for (const [key, value] of source) {
     if (!blocked.has(key.toLowerCase())) target.setHeader(key, value);
   }
@@ -292,12 +320,21 @@ const gateway = http.createServer(async (req, res) => {
   }
 
   if (url.pathname === "/health" || url.pathname === "/") {
-    json(res, 200, { status: "ok", securityGateway: true, authentication: Boolean(CLERK_JWT_KEY && CLERK_ISSUER) });
+    json(res, 200, {
+      status: "ok",
+      securityGateway: true,
+      authentication: Boolean(CLERK_JWT_KEY && CLERK_ISSUER)
+    });
     return;
   }
 
   if (!url.pathname.startsWith("/api/")) {
     json(res, 404, { error: "Not found" });
+    return;
+  }
+
+  if (req.method !== "GET") {
+    json(res, 405, { error: "Method not allowed" }, { Allow: "GET,OPTIONS" });
     return;
   }
 
@@ -309,6 +346,13 @@ const gateway = http.createServer(async (req, res) => {
 
   if (bucketLimited(userBuckets, auth.userId, USER_LIMIT)) {
     json(res, 429, { error: "User request limit exceeded. Please try again shortly." }, { "Retry-After": "60" });
+    return;
+  }
+
+  // Operational cache/scheduler details are intentionally not part of the
+  // public API surface. The FPL data endpoint is the supported client API.
+  if (url.pathname === "/api/cache") {
+    json(res, 404, { error: "Not found" });
     return;
   }
 
