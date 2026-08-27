@@ -270,11 +270,28 @@ async function getManagerPicks(
   managerId,
   gameweek
 ) {
-  return await fetchJSON(
-    `https://fantasy.premierleague.com/api/entry/${managerId}/event/${gameweek}/picks/`
-  );
-}
 
+  const url =
+    `https://fantasy.premierleague.com/api/entry/${managerId}/event/${gameweek}/picks/`;
+
+  while (true) {
+
+    try {
+
+      return await fetchJSON(url, 15000);
+
+    } catch (error) {
+
+      console.log(
+        `FPL request failed for manager ${managerId}. Waiting 5 seconds before retry...`
+      );
+
+      await new Promise(
+        resolve => setTimeout(resolve, 5000)
+      );
+    }
+  }
+}
 
 // ==================================================// ==================================================
 // ANALYZE ONE SAMPLING BAND
