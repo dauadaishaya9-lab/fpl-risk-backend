@@ -234,11 +234,19 @@ async function getSampleManagersForBand(
 
   // Fetch each standings page only once
   for (const page of pages) {
+
+    console.log(
+      `Fetching standings page ${page}`
+    );
+
     try {
+
       const data =
         await getStandingsPage(page);
 
-      const managers =
+      console.log(
+        `Received standings page ${page}`
+      ); const managers =
         data.standings?.results || [];
 
       const maxRank =
