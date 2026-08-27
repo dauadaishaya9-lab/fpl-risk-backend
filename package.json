@@ -1,10 +1,10 @@
 {
   "name": "minimal-fpl-backend",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "private": true,
   "type": "module",
   "scripts": {
-    "start": "node security-proxy.js",
+    "start": "node security-proxy-v2.js",
     "start:backend": "node server.js"
   },
   "dependencies": {
