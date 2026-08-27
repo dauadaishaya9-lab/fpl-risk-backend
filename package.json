@@ -4,7 +4,8 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "start": "node server.js"
+    "start": "node security-proxy.js",
+    "start:backend": "node server.js"
   },
   "dependencies": {
     "pg": "^8.16.3"
