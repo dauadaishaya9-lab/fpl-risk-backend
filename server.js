@@ -191,8 +191,7 @@ function randomInteger(min, max) {
     );
   }
 
-  return [...ranks];
-}
+
 // ==================================================
 // GET RANDOM SAMPLE MANAGERS FOR BAND
 // ==================================================
