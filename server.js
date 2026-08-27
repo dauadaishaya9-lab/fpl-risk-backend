@@ -169,22 +169,6 @@ function randomInteger(min, max) {
 // GENERATE RANDOM TARGET RANKS
 // ==================================================
 
-function getRandomRanksForBand(
-  band,
-  totalManagers
-) {
-
-  const actualMax =
-    band.max === Infinity
-      ? totalManagers
-      : Math.min(
-          band.max,
-          totalManagers
-        );
-
-  if (band.min > actualMax) {
-    return [];
-  }
 
   const availableManagers =
     actualMax - band.min + 1;
