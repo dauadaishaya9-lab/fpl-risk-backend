@@ -209,42 +209,55 @@ function getRandomRanksForBand(
 
   return [...ranks];
 }
-// GET SAMPLE MANAGERS FOR BAND
 // ==================================================
-// ==================================================
-// GET SAMPLE MANAGERS FOR BAND
-// ==================================================
-
-// ==================================================
-// GET SAMPLE MANAGERS FOR BAND
+// GET RANDOM SAMPLE MANAGERS FOR BAND
 // ==================================================
 
 async function getSampleManagersForBand(
   band,
   totalManagers
 ) {
-  const targetRanks =
-    getRandomRanksForBand(
-      band,
-      totalManagers
-    );
-
-  const pages = new Set();
-
-  // Convert random ranks into unique standings pages
-  for (const rank of targetRanks) {
-    pages.add(
-      getStandingsPageForRank(rank)
-    );
-  }
 
   const managersById = new Map();
 
-  // Fetch each required page only once
-  for (const page of pages) {
+  const maxRank =
+    band.max === Infinity
+      ? totalManagers
+      : Math.min(
+          band.max,
+          totalManagers
+        );
+
+  // Keep trying random pages until we have enough managers
+  // or until 10 pages have been attempted.
+  const attemptedPages = new Set();
+
+  while (
+    managersById.size < band.sampleSize &&
+    attemptedPages.size < 10
+  ) {
+
+    // Pick a random rank inside this band
+    const randomRank =
+      randomInteger(
+        band.min,
+        maxRank
+      );
+
+    const page =
+      getStandingsPageForRank(
+        randomRank
+      );
+
+    // Don't request the same page twice
+    if (attemptedPages.has(page)) {
+      continue;
+    }
+
+    attemptedPages.add(page);
 
     console.log(
-      `Fetching standings page ${page}`
+      `Band ${band.name}: fetching random page ${page}`
     );
 
     try {
@@ -255,26 +268,25 @@ async function getSampleManagersForBand(
       const managers =
         data.standings?.results || [];
 
-      const maxRank =
-        band.max === Infinity
-          ? totalManagers
-          : Math.min(
-              band.max,
-              totalManagers
-            );
-
       for (const manager of managers) {
 
         if (
           manager.rank >= band.min &&
           manager.rank <= maxRank
         ) {
+
           managersById.set(
             manager.entry,
             manager
           );
+
         }
+
       }
+
+      console.log(
+        `Band ${band.name}: ${managersById.size}/${band.sampleSize} managers`
+      );
 
     } catch (error) {
 
@@ -285,37 +297,13 @@ async function getSampleManagersForBand(
     }
   }
 
-  // Convert to array and shuffle
-  const candidates =
-    [...managersById.values()];
-
-  for (
-    let i = candidates.length - 1;
-    i > 0;
-    i--
-  ) {
-
-    const j =
-      Math.floor(
-        Math.random() * (i + 1)
-      );
-
-    [
-      candidates[i],
-      candidates[j]
-    ] = [
-      candidates[j],
-      candidates[i]
-    ];
-  }
-
-  // Return random managers from the tier
-  return candidates.slice(
+  return [
+    ...managersById.values()
+  ].slice(
     0,
     band.sampleSize
   );
 }
-// ==================================================
 // GET ONE MANAGER'S GW PICKS
 // ==================================================
 
