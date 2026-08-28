@@ -31,17 +31,23 @@ async function ensureIdentitySchema() {
   if (!pool) throw new Error("DATABASE_URL is required");
   if (identitySchemaReady) return;
   if (!identitySchemaPromise) {
-    identitySchemaPromise = pool.query(`
-      CREATE TABLE IF NOT EXISTS fpl_current_account_links (
-        user_id TEXT PRIMARY KEY,
-        season TEXT NOT NULL,
-        fpl_entry_id INTEGER NOT NULL UNIQUE,
-        verified_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-        CONSTRAINT fpl_current_account_links_entry_id_positive CHECK (fpl_entry_id > 0)
-      );
-      CREATE INDEX IF NOT EXISTS idx_fpl_current_account_links_entry_id ON fpl_current_account_links(fpl_entry_id);
-    `).then(() => { identitySchemaReady = true; }).finally(() => { identitySchemaPromise = null; });
+    identitySchemaPromise = (async () => {
+      // Only the CURRENT season's Team/Entry ID is retained. Historical IDs are not kept.
+      // Remove the earlier permanent-link table if it was created by a previous backend version.
+      await pool.query(`DROP TABLE IF EXISTS fpl_account_links`);
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS fpl_current_account_links (
+          user_id TEXT PRIMARY KEY,
+          season TEXT NOT NULL,
+          fpl_entry_id INTEGER NOT NULL UNIQUE,
+          verified_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          CONSTRAINT fpl_current_account_links_entry_id_positive CHECK (fpl_entry_id > 0)
+        );
+      `);
+      await pool.query(`CREATE INDEX IF NOT EXISTS idx_fpl_current_account_links_entry_id ON fpl_current_account_links(fpl_entry_id)`);
+      identitySchemaReady = true;
+    })().finally(() => { identitySchemaPromise = null; });
   }
   await identitySchemaPromise;
 }
