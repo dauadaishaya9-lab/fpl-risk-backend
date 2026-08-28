@@ -1,1 +1,0 @@
-Temporary marker for the hardened Clerk↔FPL identity update. This file can be removed after verification.
