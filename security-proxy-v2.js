@@ -2,7 +2,7 @@ import http from "node:http";
 import net from "node:net";
 import crypto from "node:crypto";
 import pg from "pg";
-import { analyzeRisk, getTopFive, getUsage, pool, TRIAL_LIMIT } from "./risk-engine.js";
+import { analyzeRiskForUser, getLinkedFplId, getTopFiveForUser, getUsage, linkFplAccount, pool, TRIAL_LIMIT } from "./risk-engine.js";
 
 const { Pool } = pg;
 const PUBLIC_PORT = Number(process.env.PORT || 3000);
@@ -25,7 +25,6 @@ const userBuckets = new Map();
 let backendReady = false;
 let jwksCache = { expiresAt: 0, keys: new Map() };
 let jwksRefreshPromise = null;
-
 const usagePool = DATABASE_URL ? new Pool({ connectionString: DATABASE_URL, ssl: { rejectUnauthorized: false }, max: 5, idleTimeoutMillis: 30000, connectionTimeoutMillis: 10000 }) : null;
 
 function json(res, status, data, headers = {}) {
@@ -39,7 +38,6 @@ function limited(store, key, limit) {
   current.count += 1; return current.count > limit;
 }
 setInterval(() => { const cutoff = Date.now() - WINDOW_MS; for (const store of [ipBuckets, userBuckets]) for (const [key, value] of store) if (value.startedAt < cutoff) store.delete(key); }, WINDOW_MS).unref();
-
 function tokenFrom(req) {
   const authorization = req.headers.authorization;
   if (typeof authorization === "string") { const match = authorization.match(/^Bearer\s+(.+)$/i); if (match) return match[1].trim(); }
@@ -78,10 +76,11 @@ async function authenticate(req) {
     const parts = token.split("."), header = b64json(parts[0]), payload = b64json(parts[1]);
     if (parts.length !== 3 || header.alg !== "RS256" || header.typ !== "JWT" || !header.kid) throw new Error("Invalid JWT");
     if (typeof payload.sub !== "string" || !payload.sub) throw new Error("Missing subject");
-    if (payload.iss?.replace(/\/$/, "") !== CLERK_ISSUER || !CLERK_AUTHORIZED_PARTIES.includes(payload.azp)) throw new Error("Invalid claims");
+    if (payload.iss?.replace(/\/$/, "") !== CLERK_ISSUER || typeof payload.azp !== "string" || !CLERK_AUTHORIZED_PARTIES.includes(payload.azp)) throw new Error("Invalid claims");
     const now = Math.floor(Date.now() / 1000);
     if (!Number.isFinite(payload.exp) || payload.exp <= now) throw new Error("Expired");
     if (payload.nbf !== undefined && Number(payload.nbf) > now + 5) throw new Error("Not active");
+    if (payload.iat !== undefined && (!Number.isFinite(Number(payload.iat)) || Number(payload.iat) > now + 60)) throw new Error("Invalid issued-at time");
     let keys = await jwks(false), key = keys.get(header.kid);
     if (!key) { keys = await jwks(true); key = keys.get(header.kid); }
     if (!key || !crypto.verify("RSA-SHA256", Buffer.from(`${parts[0]}.${parts[1]}`), key, b64(parts[2]))) throw new Error("Invalid signature");
@@ -91,28 +90,19 @@ async function authenticate(req) {
 function cors(origin) { if (!origin || !FRONTEND_ORIGINS.includes(origin)) return {}; return { "Access-Control-Allow-Origin": origin, "Access-Control-Allow-Credentials": "true", "Access-Control-Allow-Methods": "GET,POST,OPTIONS", "Access-Control-Allow-Headers": "Authorization,Content-Type", Vary: "Origin" }; }
 function readBody(req) {
   return new Promise((resolve, reject) => {
-    let size = 0, chunks = [];
-    req.on("data", chunk => { size += chunk.length; if (size > BODY_LIMIT) { reject(Object.assign(new Error("Request body too large"), { status: 413 })); req.destroy(); return; } chunks.push(chunk); });
-    req.on("end", () => { try { resolve(chunks.length ? JSON.parse(Buffer.concat(chunks).toString("utf8")) : {}); } catch { reject(Object.assign(new Error("Invalid JSON"), { status: 400 })); } });
-    req.on("error", reject);
+    let size = 0, chunks = [], settled = false;
+    req.on("data", chunk => { if (settled) return; size += chunk.length; if (size > BODY_LIMIT) { settled = true; reject(Object.assign(new Error("Request body too large"), { status: 413 })); req.destroy(); return; } chunks.push(chunk); });
+    req.on("end", () => { if (settled) return; try { resolve(chunks.length ? JSON.parse(Buffer.concat(chunks).toString("utf8")) : {}); } catch { reject(Object.assign(new Error("Invalid JSON"), { status: 400 })); } });
+    req.on("error", error => { if (!settled) reject(error); });
   });
 }
 async function consumeTrial(userId) {
   const upcoming = await usagePool.query(`SELECT gameweek, deadline FROM fpl_gameweeks WHERE deadline > NOW() ORDER BY deadline ASC LIMIT 1`);
   if (!upcoming.rowCount) throw new Error("No upcoming FPL deadline is available.");
   const gameweek = Number(upcoming.rows[0].gameweek), deadline = new Date(upcoming.rows[0].deadline);
-  const result = await usagePool.query(`
-    INSERT INTO user_deadline_usage (user_id, gameweek, deadline_at, calculation_count)
-    VALUES ($1,$2,$3,1)
-    ON CONFLICT (user_id,gameweek) DO UPDATE SET calculation_count=user_deadline_usage.calculation_count+1, deadline_at=EXCLUDED.deadline_at, updated_at=NOW()
-    WHERE user_deadline_usage.calculation_count < $4 RETURNING calculation_count
-  `, [userId, gameweek, deadline.toISOString(), TRIAL_LIMIT]);
-  if (!result.rowCount) {
-    const current = await usagePool.query(`SELECT calculation_count FROM user_deadline_usage WHERE user_id=$1 AND gameweek=$2`, [userId, gameweek]);
-    return { allowed: false, used: Number(current.rows[0]?.calculation_count || TRIAL_LIMIT), remaining: 0, gameweek, deadline };
-  }
-  const used = Number(result.rows[0].calculation_count);
-  return { allowed: true, used, remaining: TRIAL_LIMIT - used, gameweek, deadline };
+  const result = await usagePool.query(`INSERT INTO user_deadline_usage (user_id, gameweek, deadline_at, calculation_count) VALUES ($1,$2,$3,1) ON CONFLICT (user_id,gameweek) DO UPDATE SET calculation_count=user_deadline_usage.calculation_count+1, deadline_at=EXCLUDED.deadline_at, updated_at=NOW() WHERE user_deadline_usage.calculation_count < $4 RETURNING calculation_count`, [userId, gameweek, deadline.toISOString(), TRIAL_LIMIT]);
+  if (!result.rowCount) { const current = await usagePool.query(`SELECT calculation_count FROM user_deadline_usage WHERE user_id=$1 AND gameweek=$2`, [userId, gameweek]); return { allowed: false, used: Number(current.rows[0]?.calculation_count || TRIAL_LIMIT), remaining: 0, gameweek, deadline }; }
+  const used = Number(result.rows[0].calculation_count); return { allowed: true, used, remaining: TRIAL_LIMIT - used, gameweek, deadline };
 }
 async function refundTrial(userId, gameweek) { await usagePool.query(`UPDATE user_deadline_usage SET calculation_count=GREATEST(calculation_count-1,0),updated_at=NOW() WHERE user_id=$1 AND gameweek=$2`, [userId, gameweek]); }
 async function proxyToBackend(req, res, userId) {
@@ -140,14 +130,29 @@ const gateway = http.createServer(async (req,res) => {
     if (!auth.ok) return json(res,auth.status,{error:auth.error});
     if (limited(userBuckets,auth.userId,USER_LIMIT)) return json(res,429,{error:"User request limit exceeded."},{"Retry-After":"60"});
 
+    if (url.pathname === "/api/account/fpl") {
+      if (req.method === "GET") {
+        const fplId = await getLinkedFplId(auth.userId);
+        return json(res,200,fplId ? { linked: true, fplId } : { linked: false, fplId: null },cors(origin));
+      }
+      if (req.method !== "POST") return json(res,405,{error:"Method not allowed"},{Allow:"GET,POST,OPTIONS"});
+      try {
+        const body = await readBody(req);
+        const fplId = Number(body.fplId);
+        const linked = await linkFplAccount(auth.userId, fplId);
+        return json(res,200,{ linked: true, ...linked },cors(origin));
+      } catch (error) {
+        return json(res,error.status || 400,{error:error.message,code:error.code || "FPL_ACCOUNT_LINK_FAILED"},cors(origin));
+      }
+    }
+
     if (url.pathname === "/api/calculator/templates") {
-      if (req.method !== "GET") return json(res,405,{error:"Method not allowed"},{Allow:"GET"});
-      const fplId = Number(url.searchParams.get("fplId"));
-      if (!Number.isSafeInteger(fplId) || fplId <= 0) return json(res,400,{error:"Valid fplId is required."});
-      return json(res,200,await getTopFive(fplId),cors(origin));
+      if (req.method !== "GET") return json(res,405,{error:"Method not allowed"},{Allow:"GET,OPTIONS"});
+      try { return json(res,200,await getTopFiveForUser(auth.userId),cors(origin)); }
+      catch (error) { return json(res,error.status || 400,{error:error.message,code:error.code || "CALCULATOR_ERROR"},cors(origin)); }
     }
     if (url.pathname === "/api/calculator/usage") {
-      if (req.method !== "GET") return json(res,405,{error:"Method not allowed"},{Allow:"GET"});
+      if (req.method !== "GET") return json(res,405,{error:"Method not allowed"},{Allow:"GET,OPTIONS"});
       return json(res,200,await getUsage(auth.userId),cors(origin));
     }
     if (url.pathname === "/api/calculator/analyze") {
@@ -157,14 +162,12 @@ const gateway = http.createServer(async (req,res) => {
       if (!trial.allowed) return json(res,429,{error:"Free analysis limit reached for this gameweek.",code:"GAMEWEEK_TRIAL_LIMIT",used:trial.used,remaining:0,limit:TRIAL_LIMIT,gameweek:trial.gameweek,resetsAt:trial.deadline.toISOString()},{"Retry-After":String(Math.max(1,Math.ceil((trial.deadline.getTime()-Date.now())/1000)))});
       try {
         const body = await readBody(req);
-        const fplId = Number(body.fplId), playerId = Number(body.playerId);
-        const result = await analyzeRisk({ fplId, playerId, owns: body.owns, captain: body.captain, tripleCaptain: body.tripleCaptain, expectedPoints: Number(body.expectedPoints) });
+        const result = await analyzeRiskForUser(auth.userId,{ playerId:Number(body.playerId), owns:body.owns, captain:body.captain, tripleCaptain:body.tripleCaptain, expectedPoints:Number(body.expectedPoints) });
         const usage = await getUsage(auth.userId);
         return json(res,200,{ ...result, usage },cors(origin));
       } catch (error) {
         await refundTrial(auth.userId,trial.gameweek);
-        const status = error.status || 400;
-        return json(res,status,{error:error.message});
+        return json(res,error.status || 400,{error:error.message,code:error.code || "CALCULATOR_ERROR"},cors(origin));
       }
     }
 
