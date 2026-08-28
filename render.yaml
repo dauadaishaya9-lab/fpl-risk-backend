@@ -3,7 +3,7 @@ services:
     name: fpl-risk-backend
     runtime: node
     buildCommand: npm install
-    startCommand: node security-proxy-v3.js
+    startCommand: node security-proxy-v4.js
     healthCheckPath: /health
     envVars:
       - key: DATABASE_URL
