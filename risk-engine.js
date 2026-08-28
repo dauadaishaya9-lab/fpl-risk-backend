@@ -15,15 +15,84 @@ export const RANK_TIERS = [
 ];
 const pool = process.env.DATABASE_URL ? new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false }, max: 5, idleTimeoutMillis: 30000, connectionTimeoutMillis: 10000 }) : null;
 let bootstrapCache = { data: null, expiresAt: 0 };
-async function fetchJSON(url) { const controller = new AbortController(); const timer = setTimeout(() => controller.abort(), 15000); try { const response = await fetch(url, { signal: controller.signal, headers: { "User-Agent": "FPL-Risk-Calculator/1.0" } }); if (!response.ok) throw new Error(`HTTP ${response.status}`); return await response.json(); } finally { clearTimeout(timer); } }
+let identitySchemaReady = false;
+let identitySchemaPromise = null;
+
+async function ensureIdentitySchema() {
+  if (!pool) throw new Error("DATABASE_URL is required");
+  if (identitySchemaReady) return;
+  if (!identitySchemaPromise) {
+    identitySchemaPromise = pool.query(`
+      CREATE TABLE IF NOT EXISTS fpl_account_links (
+        user_id TEXT PRIMARY KEY,
+        fpl_id INTEGER NOT NULL UNIQUE,
+        verified_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        CONSTRAINT fpl_account_links_fpl_id_positive CHECK (fpl_id > 0)
+      );
+      CREATE INDEX IF NOT EXISTS idx_fpl_account_links_fpl_id ON fpl_account_links(fpl_id);
+    `).then(() => { identitySchemaReady = true; }).finally(() => { identitySchemaPromise = null; });
+  }
+  await identitySchemaPromise;
+}
+
+async function fetchJSON(url) {
+  const controller = new AbortController(); const timer = setTimeout(() => controller.abort(), 15000);
+  try { const response = await fetch(url, { signal: controller.signal, headers: { "User-Agent": "FPL-Risk-Calculator/1.0" } }); if (!response.ok) throw new Error(`HTTP ${response.status}`); return await response.json(); }
+  finally { clearTimeout(timer); }
+}
 async function getBootstrap() { if (bootstrapCache.data && bootstrapCache.expiresAt > Date.now()) return bootstrapCache.data; const data = await fetchJSON(FPL_URL); bootstrapCache = { data, expiresAt: Date.now() + 120000 }; return data; }
 function tierForRank(rank) { return RANK_TIERS.find(tier => rank >= tier.min && rank <= tier.max) || null; }
+
+export async function getLinkedFplId(userId) {
+  if (!userId || typeof userId !== "string" || userId.length > 256) throw new Error("Invalid authenticated user");
+  await ensureIdentitySchema();
+  const result = await pool.query(`SELECT fpl_id FROM fpl_account_links WHERE user_id=$1`, [userId]);
+  return result.rows[0]?.fpl_id ? Number(result.rows[0].fpl_id) : null;
+}
+
+export async function linkFplAccount(userId, fplId) {
+  if (!userId || typeof userId !== "string" || userId.length > 256) throw new Error("Invalid authenticated user");
+  if (!Number.isSafeInteger(fplId) || fplId <= 0) throw Object.assign(new Error("Invalid FPL ID"), { status: 400 });
+  await ensureIdentitySchema();
+
+  // Verify the submitted FPL ID against FPL before associating it with the Clerk user.
+  const manager = await fetchJSON(`${ENTRY_URL}${fplId}/`);
+  if (Number(manager.id) !== fplId || !Number.isSafeInteger(Number(manager.summary_overall_rank)) || Number(manager.summary_overall_rank) < 1) {
+    throw Object.assign(new Error("FPL account could not be verified"), { status: 404 });
+  }
+
+  const existingUser = await pool.query(`SELECT fpl_id FROM fpl_account_links WHERE user_id=$1`, [userId]);
+  if (existingUser.rowCount && Number(existingUser.rows[0].fpl_id) !== fplId) {
+    throw Object.assign(new Error("An FPL account is already linked to this user. Contact support to change it."), { status: 409 });
+  }
+  const existingFpl = await pool.query(`SELECT user_id FROM fpl_account_links WHERE fpl_id=$1`, [fplId]);
+  if (existingFpl.rowCount && existingFpl.rows[0].user_id !== userId) {
+    throw Object.assign(new Error("That FPL account is already linked to another user."), { status: 409 });
+  }
+
+  await pool.query(`
+    INSERT INTO fpl_account_links (user_id, fpl_id, verified_at, updated_at)
+    VALUES ($1,$2,NOW(),NOW())
+    ON CONFLICT (user_id) DO UPDATE SET fpl_id=EXCLUDED.fpl_id, verified_at=NOW(), updated_at=NOW()
+  `, [userId, fplId]);
+
+  return {
+    fplId,
+    rank: Number(manager.summary_overall_rank),
+    playerName: `${manager.player_first_name || ""} ${manager.player_last_name || ""}`.trim(),
+    teamName: manager.name || null,
+    verifiedAt: new Date().toISOString()
+  };
+}
+
 export async function getManagerContext(fplId) {
   if (!Number.isSafeInteger(fplId) || fplId <= 0) throw new Error("Invalid FPL ID");
   const manager = await fetchJSON(`${ENTRY_URL}${fplId}/`), rank = Number(manager.summary_overall_rank), tier = tierForRank(rank);
   if (!Number.isSafeInteger(rank) || rank < 1 || !tier) throw new Error("FPL manager rank is unavailable or outside configured tiers");
   return { managerId: fplId, playerName: `${manager.player_first_name || ""} ${manager.player_last_name || ""}`.trim(), teamName: manager.name || null, rank, tier };
 }
+
 async function latestCompletedGameweek() { if (!pool) throw new Error("DATABASE_URL is required"); const result = await pool.query(`SELECT gameweek, season, deadline, picks_captured_at FROM fpl_gameweeks WHERE status='complete' ORDER BY gameweek DESC LIMIT 1`); return result.rows[0] || null; }
 async function exposureRows(gameweek, tierName) { const result = await pool.query(`SELECT manager_id, locked_rank, picks FROM fpl_sample_managers WHERE gameweek=$1 AND locked_tier=$2 AND picks IS NOT NULL ORDER BY locked_rank ASC`, [gameweek, tierName]); return result.rows; }
 function buildExposure(rows) {
@@ -35,6 +104,21 @@ function buildExposure(rows) {
   }
   return { ownership, captaincy, tripleCaptaincy };
 }
+
+async function resolveUserFplId(userId) {
+  const fplId = await getLinkedFplId(userId);
+  if (!fplId) throw Object.assign(new Error("Link your FPL account before using the calculator"), { status: 409, code: "FPL_ACCOUNT_NOT_LINKED" });
+  return fplId;
+}
+
+export async function getTopFiveForUser(userId) {
+  return getTopFive(await resolveUserFplId(userId));
+}
+
+export async function analyzeRiskForUser(userId, input) {
+  return analyzeRisk({ fplId: await resolveUserFplId(userId), ...input });
+}
+
 export async function getTopFive(fplId) {
   const context = await getManagerContext(fplId), snapshot = await latestCompletedGameweek();
   if (!snapshot) throw new Error("No completed risk snapshot is ready yet");
