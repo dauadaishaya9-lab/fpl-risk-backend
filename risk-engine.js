@@ -15,101 +15,41 @@ export const RANK_TIERS = [
 ];
 const pool = process.env.DATABASE_URL ? new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false }, max: 5, idleTimeoutMillis: 30000, connectionTimeoutMillis: 10000 }) : null;
 let bootstrapCache = { data: null, expiresAt: 0 };
-let identitySchemaReady = false;
-let identitySchemaPromise = null;
 
 function currentSeasonKey(bootstrap) {
   const raw = bootstrap?.events?.find?.(event => event?.is_current)?.season;
   if (typeof raw === "string" && raw) return raw;
   const now = new Date();
   const year = now.getUTCFullYear();
-  const month = now.getUTCMonth() + 1;
-  return month >= 8 ? `${year}/${String(year + 1).slice(-2)}` : `${year - 1}/${String(year).slice(-2)}`;
-}
-
-async function ensureIdentitySchema() {
-  if (!pool) throw new Error("DATABASE_URL is required");
-  if (identitySchemaReady) return;
-  if (!identitySchemaPromise) {
-    identitySchemaPromise = (async () => {
-      // Only the CURRENT season's Team/Entry ID is retained. Historical IDs are not kept.
-      // Remove the earlier permanent-link table if it was created by a previous backend version.
-      await pool.query(`DROP TABLE IF EXISTS fpl_account_links`);
-      await pool.query(`
-        CREATE TABLE IF NOT EXISTS fpl_current_account_links (
-          user_id TEXT PRIMARY KEY,
-          season TEXT NOT NULL,
-          fpl_entry_id INTEGER NOT NULL UNIQUE,
-          verified_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-          updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-          CONSTRAINT fpl_current_account_links_entry_id_positive CHECK (fpl_entry_id > 0)
-        );
-      `);
-      await pool.query(`CREATE INDEX IF NOT EXISTS idx_fpl_current_account_links_entry_id ON fpl_current_account_links(fpl_entry_id)`);
-      identitySchemaReady = true;
-    })().finally(() => { identitySchemaPromise = null; });
-  }
-  await identitySchemaPromise;
+  return now.getUTCMonth() + 1 >= 8 ? `${year}/${String(year + 1).slice(-2)}` : `${year - 1}/${String(year).slice(-2)}`;
 }
 
 async function fetchJSON(url) {
   const controller = new AbortController(); const timer = setTimeout(() => controller.abort(), 15000);
-  try { const response = await fetch(url, { signal: controller.signal, headers: { "User-Agent": "FPL-Risk-Calculator/1.0" } }); if (!response.ok) throw new Error(`HTTP ${response.status}`); return await response.json(); }
+  try { const response = await fetch(url, { signal: controller.signal, headers: { "User-Agent": "FPL-Risk/1.0" } }); if (!response.ok) throw new Error(`HTTP ${response.status}`); return await response.json(); }
   finally { clearTimeout(timer); }
 }
 async function getBootstrap() { if (bootstrapCache.data && bootstrapCache.expiresAt > Date.now()) return bootstrapCache.data; const data = await fetchJSON(FPL_URL); bootstrapCache = { data, expiresAt: Date.now() + 120000 }; return data; }
 function tierForRank(rank) { return RANK_TIERS.find(tier => rank >= tier.min && rank <= tier.max) || null; }
 
-export async function getLinkedFplId(userId) {
-  if (!userId || typeof userId !== "string" || userId.length > 256) throw new Error("Invalid authenticated user");
-  await ensureIdentitySchema();
-  const season = currentSeasonKey(await getBootstrap());
-  const result = await pool.query(`SELECT fpl_entry_id FROM fpl_current_account_links WHERE user_id=$1 AND season=$2`, [userId, season]);
-  return result.rows[0]?.fpl_entry_id ? Number(result.rows[0].fpl_entry_id) : null;
-}
-
-export async function linkFplAccount(userId, fplId) {
-  if (!userId || typeof userId !== "string" || userId.length > 256) throw new Error("Invalid authenticated user");
-  if (!Number.isSafeInteger(fplId) || fplId <= 0) throw Object.assign(new Error("Invalid FPL Team ID"), { status: 400 });
-  await ensureIdentitySchema();
-
+// Team/Entry IDs are deliberately NOT persisted. The caller supplies the
+// current-season ID and this backend verifies it against FPL on use.
+export async function verifyFplEntry(fplId) {
+  if (!Number.isSafeInteger(fplId) || fplId <= 0) throw Object.assign(new Error("Invalid FPL Team ID"), { status: 400, code: "INVALID_FPL_TEAM_ID" });
   const bootstrap = await getBootstrap();
   const season = currentSeasonKey(bootstrap);
-  const manager = await fetchJSON(`${ENTRY_URL}${fplId}/`);
-  if (Number(manager.id) !== fplId || !Number.isSafeInteger(Number(manager.summary_overall_rank)) || Number(manager.summary_overall_rank) < 1) {
-    throw Object.assign(new Error("FPL Team ID could not be verified"), { status: 404 });
-  }
-
-  const existingUser = await pool.query(`SELECT season, fpl_entry_id FROM fpl_current_account_links WHERE user_id=$1`, [userId]);
-  if (existingUser.rowCount && existingUser.rows[0].season === season && Number(existingUser.rows[0].fpl_entry_id) !== fplId) {
-    throw Object.assign(new Error("An FPL Team ID is already linked for this season. Contact support to change it."), { status: 409 });
-  }
-  const existingFpl = await pool.query(`SELECT user_id FROM fpl_current_account_links WHERE fpl_entry_id=$1`, [fplId]);
-  if (existingFpl.rowCount && existingFpl.rows[0].user_id !== userId) {
-    throw Object.assign(new Error("That FPL Team ID is already linked to another user."), { status: 409 });
-  }
-
-  await pool.query(`
-    INSERT INTO fpl_current_account_links (user_id, season, fpl_entry_id, verified_at, updated_at)
-    VALUES ($1,$2,$3,NOW(),NOW())
-    ON CONFLICT (user_id) DO UPDATE SET season=EXCLUDED.season, fpl_entry_id=EXCLUDED.fpl_entry_id, verified_at=NOW(), updated_at=NOW()
-  `, [userId, season, fplId]);
-
-  return {
-    fplId,
-    season,
-    rank: Number(manager.summary_overall_rank),
-    playerName: `${manager.player_first_name || ""} ${manager.player_last_name || ""}`.trim(),
-    teamName: manager.name || null,
-    verifiedAt: new Date().toISOString()
-  };
+  let manager;
+  try { manager = await fetchJSON(`${ENTRY_URL}${fplId}/`); }
+  catch { throw Object.assign(new Error("FPL Team ID could not be verified"), { status: 404, code: "FPL_TEAM_NOT_FOUND" }); }
+  const rank = Number(manager.summary_overall_rank);
+  if (Number(manager.id) !== fplId || !Number.isSafeInteger(rank) || rank < 1) throw Object.assign(new Error("FPL Team ID could not be verified for the current season"), { status: 404, code: "FPL_TEAM_NOT_FOUND" });
+  return { fplId, season, rank, playerName: `${manager.player_first_name || ""} ${manager.player_last_name || ""}`.trim(), teamName: manager.name || null };
 }
 
 export async function getManagerContext(fplId) {
-  if (!Number.isSafeInteger(fplId) || fplId <= 0) throw new Error("Invalid FPL Team ID");
-  const manager = await fetchJSON(`${ENTRY_URL}${fplId}/`), rank = Number(manager.summary_overall_rank), tier = tierForRank(rank);
-  if (!Number.isSafeInteger(rank) || rank < 1 || !tier) throw new Error("FPL manager rank is unavailable or outside configured tiers");
-  return { managerId: fplId, playerName: `${manager.player_first_name || ""} ${manager.player_last_name || ""}`.trim(), teamName: manager.name || null, rank, tier };
+  const verified = await verifyFplEntry(fplId), tier = tierForRank(verified.rank);
+  if (!tier) throw new Error("FPL manager rank is unavailable or outside configured tiers");
+  return { managerId: verified.fplId, playerName: verified.playerName, teamName: verified.teamName, rank: verified.rank, tier, season: verified.season };
 }
 
 async function latestCompletedGameweek() { if (!pool) throw new Error("DATABASE_URL is required"); const result = await pool.query(`SELECT gameweek, season, deadline, picks_captured_at FROM fpl_gameweeks WHERE status='complete' ORDER BY gameweek DESC LIMIT 1`); return result.rows[0] || null; }
@@ -123,15 +63,6 @@ function buildExposure(rows) {
   }
   return { ownership, captaincy, tripleCaptaincy };
 }
-
-async function resolveUserFplId(userId) {
-  const fplId = await getLinkedFplId(userId);
-  if (!fplId) throw Object.assign(new Error("Link your FPL Team ID before using the calculator"), { status: 409, code: "FPL_ACCOUNT_NOT_LINKED" });
-  return fplId;
-}
-
-export async function getTopFiveForUser(userId) { return getTopFive(await resolveUserFplId(userId)); }
-export async function analyzeRiskForUser(userId, input) { return analyzeRisk({ fplId: await resolveUserFplId(userId), ...input }); }
 
 export async function getTopFive(fplId) {
   const context = await getManagerContext(fplId), snapshot = await latestCompletedGameweek();
