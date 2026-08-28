@@ -3,7 +3,7 @@ services:
     name: fpl-risk-backend
     runtime: node
     buildCommand: npm install
-    startCommand: node security-proxy.js
+    startCommand: node security-proxy-seasonal.js
     healthCheckPath: /health
     envVars:
       - key: DATABASE_URL
@@ -11,6 +11,8 @@ services:
       - key: CLERK_JWT_KEY
         sync: false
       - key: CLERK_ISSUER
+        sync: false
+      - key: CLERK_JWKS_URL
         sync: false
       - key: CLERK_AUTHORIZED_PARTIES
         sync: false
