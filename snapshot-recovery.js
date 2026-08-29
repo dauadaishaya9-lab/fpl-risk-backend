@@ -8,19 +8,27 @@ const STANDINGS_URL = "https://fantasy.premierleague.com/api/leagues-classic/314
 const ENTRY_URL = "https://fantasy.premierleague.com/api/entry/";
 const LOCK_HOURS_BEFORE_DEADLINE = 1;
 
-const BANDS = [
+const FIXED_BANDS = [
   { name:"1-10000", min:1, max:10000, sampleSize:10 },
   { name:"10001-50000", min:10001, max:50000, sampleSize:15 },
   { name:"50001-100000", min:50001, max:100000, sampleSize:20 },
   { name:"100001-250000", min:100001, max:250000, sampleSize:25 },
   { name:"250001-500000", min:250001, max:500000, sampleSize:30 },
   { name:"500001-1000000", min:500001, max:1000000, sampleSize:35 },
-  { name:"1000001-2000000", min:1000001, max:2000000, sampleSize:40 },
-  { name:"2000001-3000000", min:2000001, max:3000000, sampleSize:45 },
-  { name:"3000001-4000000", min:3000001, max:4000000, sampleSize:50 },
-  { name:"4000001-5000000", min:4000001, max:5000000, sampleSize:55 },
-  { name:"5000001+", min:5000001, max:Infinity, sampleSize:60 },
 ];
+const MILLION_BAND_START=1000001;
+const MILLION_BAND_SIZE=1000000;
+const MILLION_BAND_SAMPLE_SIZE=60;
+
+function getBands(totalManagers) {
+  const total=Math.max(0,Math.floor(Number(totalManagers)||0));
+  const bands=FIXED_BANDS.map(b=>({...b}));
+  for(let min=MILLION_BAND_START;min<=total;min+=MILLION_BAND_SIZE){
+    const max=Math.min(min+MILLION_BAND_SIZE-1,total);
+    bands.push({name:`${min}-${max}`,min,max,sampleSize:Math.min(MILLION_BAND_SAMPLE_SIZE,max-min+1)});
+  }
+  return bands;
+}
 
 const pool = DATABASE_URL
   ? new Pool({ connectionString: DATABASE_URL, ssl: { rejectUnauthorized: false }, max: 3, idleTimeoutMillis: 30000, connectionTimeoutMillis: 10000 })
@@ -80,12 +88,11 @@ function seasonLabel() {
   return `${year}/${String(year + 1).slice(-2)}`;
 }
 
-function tierForRank(rank) {
-  return BANDS.find(b => rank >= b.min && rank <= b.max)?.name || null;
+function tierForRank(rank,totalManagers) {
+  return getBands(totalManagers).find(b => rank >= b.min && rank <= b.max)?.name || null;
 }
 
 function recoverySearchRange(band, totalManagers) {
-  if (band.max === Infinity) return { min: Math.max(band.min, Math.floor(totalManagers * 0.75)), max: totalManagers };
   return { min: band.min === 1 ? 1 : Math.max(1, Math.floor(band.min * 0.75)), max: Math.min(totalManagers, Math.ceil(band.max * 1.25)) };
 }
 
@@ -113,7 +120,7 @@ async function recoverBand({ band, season, gameweek, totalManagers }) {
       const id = Number(manager.entry);
       const historicalRank = Number(manager.last_rank);
       if (!Number.isSafeInteger(id) || !Number.isSafeInteger(historicalRank)) continue;
-      if (tierForRank(historicalRank) !== band.name || seen.has(id)) continue;
+      if (tierForRank(historicalRank,totalManagers) !== band.name || seen.has(id)) continue;
       seen.add(id);
       candidates.push(manager);
     }
@@ -134,7 +141,7 @@ async function recoverBand({ band, season, gameweek, totalManagers }) {
     if (picks.length !== 15) throw new Error(`Manager ${managerId} has ${picks.length} picks for GW ${gameweek}`);
     const captain = picks.find(p => p.is_captain === true);
     const triple = picks.find(p => p.is_captain === true && Number(p.multiplier) === 3);
-    recovered.push({ managerId, lockedRank: Number(historyRow.overall_rank), lockedTier: tierForRank(Number(historyRow.overall_rank)), managerName: manager.player_name || null, teamName: manager.entry_name || null, overallPointsAtLock: Number(historyRow.total_points) || 0, picks, activeChip: picksData.active_chip ?? null, captain: captain ? Number(captain.element) : null, tripleCaptain: triple ? Number(triple.element) : null });
+    recovered.push({ managerId, lockedRank: Number(historyRow.overall_rank), lockedTier: tierForRank(Number(historyRow.overall_rank),totalManagers), managerName: manager.player_name || null, teamName: manager.entry_name || null, overallPointsAtLock: Number(historyRow.total_points) || 0, picks, activeChip: picksData.active_chip ?? null, captain: captain ? Number(captain.element) : null, tripleCaptain: triple ? Number(triple.element) : null });
   }
   return recovered;
 }
@@ -167,7 +174,8 @@ async function recoverMissedSnapshot() {
   console.log(`GW ${previous.id} recovery: missed pre-deadline lock detected; rebuilding exactly one previous snapshot.`);
   const recovered = [];
   try {
-    for (const band of BANDS) {
+    const bands=getBands(Number(bootstrap.total_players)||0);
+    for (const band of bands) {
       const rows = await recoverBand({ band, season, gameweek: Number(previous.id), totalManagers: Number(bootstrap.total_players) || 0 });
       recovered.push(...rows);
       console.log(`GW ${previous.id} recovery ${band.name}: ${rows.length}/${band.sampleSize} managers verified.`);
