@@ -1,13 +1,6 @@
 const ENTRY_URL = "https://fantasy.premierleague.com/api/entry/";
 import { pool } from "./risk-engine.js";
 
-const LEGACY_PAID_USER_IDS = new Set(
-  (process.env.RANK_IMPACT_PAID_USER_IDS || "")
-    .split(",")
-    .map(v => v.trim())
-    .filter(Boolean)
-);
-
 let subscriptionSchemaReady = false;
 
 async function ensureSubscriptionSchema() {
@@ -48,11 +41,7 @@ export async function isPaidUser(userId) {
 export async function isRankImpactEntitled(userId, isOwner) {
   if (typeof userId !== "string") return false;
   if (isOwner(userId)) return true;
-  if (await isPaidUser(userId)) return true;
-
-  // Temporary compatibility for any explicitly configured legacy paid IDs.
-  // New production subscriptions should be written to user_subscriptions with expires_at.
-  return LEGACY_PAID_USER_IDS.has(userId);
+  return isPaidUser(userId);
 }
 
 export async function grantMonthlySubscription(userId) {
@@ -89,26 +78,22 @@ async function fetchJSON(url) {
 
 function interpolateRank(points, samples) {
   if (samples.length < 2) return null;
-
   const rows = [...samples].sort((a, b) => b.points - a.points || a.rank - b.rank);
   if (points >= rows[0].points) {
     const a = rows[0], b = rows[1];
     return a.rank + ((a.points - points) * (b.rank - a.rank)) / (a.points - b.points || 1);
   }
-
   const last = rows.length - 1;
   if (points <= rows[last].points) {
     const a = rows[last - 1], b = rows[last];
     return a.rank + ((a.points - points) * (b.rank - a.rank)) / (a.points - b.points || 1);
   }
-
   for (let i = 0; i < last; i += 1) {
     const a = rows[i], b = rows[i + 1];
     if (points <= a.points && points >= b.points) {
       return a.rank + ((a.points - points) * (b.rank - a.rank)) / (a.points - b.points || 1);
     }
   }
-
   return null;
 }
 
@@ -117,7 +102,6 @@ function localSlopes(points, samples) {
     .sort((a, b) => Math.abs(a.points - points) - Math.abs(b.points - points))
     .slice(0, 5)
     .sort((a, b) => b.points - a.points);
-
   const slopes = [];
   for (let i = 0; i < rows.length - 1; i += 1) {
     const dp = rows[i].points - rows[i + 1].points;
@@ -138,18 +122,13 @@ export async function estimateRankImpact({ fplId, relativeSwing, gameweek, tierN
   const snapshotResult = await pool.query(
     `SELECT gameweek, season, deadline, picks_captured_at
        FROM fpl_gameweeks
-      WHERE gameweek=$1
-        AND status='complete'
+      WHERE gameweek=$1 AND status='complete'
       LIMIT 1`,
     [gameweek]
   );
   const snapshot = snapshotResult.rows[0];
   if (!snapshot) throw new Error("Requested risk snapshot is not complete");
 
-  // Use the user's historical rank and total points for the same GW as the
-  // sampled managers' locked_rank and overall_points_at_lock. This keeps the
-  // interpolation on one consistent snapshot instead of mixing current data
-  // with an older snapshot.
   const history = await fetchJSON(`${ENTRY_URL}${fplId}/history/`);
   const historyRow = (history.current || []).find(row => Number(row.event) === gameweek);
   if (!historyRow) throw new Error("User snapshot history unavailable");
@@ -169,20 +148,14 @@ export async function estimateRankImpact({ fplId, relativeSwing, gameweek, tierN
       ORDER BY locked_rank ASC`,
     [gameweek, tierName]
   );
-
   const samples = result.rows
     .map(row => ({ rank: Number(row.locked_rank), points: Number(row.overall_points_at_lock) }))
     .filter(row => Number.isSafeInteger(row.rank) && Number.isFinite(row.points));
-
-  if (samples.length < 3) {
-    throw new Error("Not enough sampled score data for rank-impact estimation");
-  }
+  if (samples.length < 3) throw new Error("Not enough sampled score data for rank-impact estimation");
 
   const before = interpolateRank(snapshotPoints, samples);
   const after = interpolateRank(snapshotPoints + relativeSwing, samples);
-  if (!Number.isFinite(before) || !Number.isFinite(after)) {
-    throw new Error("Unable to estimate rank impact from sampled score data");
-  }
+  if (!Number.isFinite(before) || !Number.isFinite(after)) throw new Error("Unable to estimate rank impact from sampled score data");
 
   const places = before - after;
   const slopes = localSlopes(snapshotPoints, samples);
@@ -205,10 +178,7 @@ export async function estimateRankImpact({ fplId, relativeSwing, gameweek, tierN
     sampleSize: samples.length,
     gameweek: Number(snapshot.gameweek),
     season: snapshot.season,
-    snapshot: {
-      deadline: snapshot.deadline,
-      picksCapturedAt: snapshot.picks_captured_at,
-    },
+    snapshot: { deadline: snapshot.deadline, picksCapturedAt: snapshot.picks_captured_at },
     method: "snapshot-consistent local score-to-rank interpolation from sampled managers",
   };
 }
