@@ -7,7 +7,7 @@ const { Pool } = pg;
 const PUBLIC_PORT = Number(process.env.PORT || 3000);
 const INTERNAL_PORT = Number(process.env.INTERNAL_PORT || 3001);
 const DATABASE_URL = process.env.DATABASE_URL;
-const FRONTEND_ORIGINS = (process.env.FRONTEND_ORIGINS || "http://localhost:5173").split(",").map(v => v.trim()).filter(Boolean);
+const FRONTEND_ORIGINS = (process.env.FRONTEND_ORIGINS || "https://fpl-risk-frontend.onrender.com,http://localhost:5173").split(",").map(v => v.trim()).filter(Boolean);
 const CLERK_ISSUER = (process.env.CLERK_ISSUER || "").replace(/\/$/, "");
 const CLERK_JWKS_URL = process.env.CLERK_JWKS_URL || "";
 const CLERK_AUTHORIZED_PARTIES = (process.env.CLERK_AUTHORIZED_PARTIES || "").split(",").map(v => v.trim()).filter(Boolean);
