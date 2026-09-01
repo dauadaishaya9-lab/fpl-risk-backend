@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "start": "node security-proxy-v3.js",
+    "start": "node security-proxy-v4.js",
     "start:backend": "node server.js"
   },
   "dependencies": {
