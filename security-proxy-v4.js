@@ -1,10 +1,11 @@
 import http from "node:http";
 import crypto from "node:crypto";
 import pg from "pg";
-import { estimateRankImpact, isRankImpactEntitled } from "./rank-impact.js";
+import { estimateRankImpact, isPaidUser, isRankImpactEntitled } from "./rank-impact.js";
 import { isOwner,
   analyzeRiskForUser,
   getTopFiveForUser,
+  getAllPlayers,
   getUsage,
   getLinkedFplId,
   linkFplAccount,
@@ -16,7 +17,7 @@ const { Pool } = pg;
 const PUBLIC_PORT = Number(process.env.PORT || 3000);
 const INTERNAL_PORT = Number(process.env.INTERNAL_PORT || 3001);
 const DATABASE_URL = process.env.DATABASE_URL;
-const FRONTEND_ORIGINS = (process.env.FRONTEND_ORIGINS || "http://localhost:5173")
+const FRONTEND_ORIGINS = (process.env.FRONTEND_ORIGINS || "http://localhost:5173,https://fpl-risk-frontend.onrender.com")
   .split(",").map(v => v.trim()).filter(Boolean);
 const CLERK_ISSUER = (process.env.CLERK_ISSUER || "").replace(/\/$/, "");
 const CLERK_JWKS_URL = process.env.CLERK_JWKS_URL || "";
@@ -212,15 +213,16 @@ const gateway = http.createServer(async (req, res) => {
     const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
     const origin = req.headers.origin;
     if (origin && !FRONTEND_ORIGINS.includes(origin)) return json(res, 403, { error: "Origin not allowed." });
+    const responseCors = cors(origin);
     if (req.method === "OPTIONS") { res.writeHead(204, cors(origin)); return res.end(); }
-    if (limited(ipBuckets, clientIp(req), IP_LIMIT)) return json(res, 429, { error: "Too many requests." }, { "Retry-After": "60" });
-    if (url.pathname === "/health" || url.pathname === "/") return json(res, backendReady && !configError() ? 200 : 503, { status: backendReady && !configError() ? "ok" : "starting", securityGateway: true, backendReady, authentication: !configError(), fplIdentityStorage: "current-season-only" });
-    if (!url.pathname.startsWith("/api/")) return json(res, 404, { error: "Not found" });
-    if (!backendReady) return json(res, 503, { error: "Backend is starting." }, { "Retry-After": "3" });
+    if (limited(ipBuckets, clientIp(req), IP_LIMIT)) return json(res, 429, { error: "Too many requests." }, { ...responseCors, "Retry-After": "60" });
+    if (url.pathname === "/health" || url.pathname === "/") return json(res, backendReady && !configError() ? 200 : 503, { status: backendReady && !configError() ? "ok" : "starting", securityGateway: true, backendReady, authentication: !configError(), fplIdentityStorage: "current-season-only" }, responseCors);
+    if (!url.pathname.startsWith("/api/")) return json(res, 404, { error: "Not found" }, responseCors);
+    if (!backendReady) return json(res, 503, { error: "Backend is starting." }, { ...responseCors, "Retry-After": "3" });
 
     const auth = await authenticate(req);
-    if (!auth.ok) return json(res, auth.status, { error: auth.error });
-    if (limited(userBuckets, auth.userId, USER_LIMIT)) return json(res, 429, { error: "User request limit exceeded." }, { "Retry-After": "60" });
+    if (!auth.ok) return json(res, auth.status, { error: auth.error }, responseCors);
+    if (limited(userBuckets, auth.userId, USER_LIMIT)) return json(res, 429, { error: "User request limit exceeded." }, { ...responseCors, "Retry-After": "60" });
 
     if (url.pathname === "/api/account/fpl") {
       if (req.method === "GET") {
@@ -233,7 +235,7 @@ const gateway = http.createServer(async (req, res) => {
           return json(res, error.status || 503, { error: error.message, code: error.code || "FPL_ACCOUNT_STATUS_FAILED" }, cors(origin));
         }
       }
-      if (req.method !== "POST") return json(res, 405, { error: "Method not allowed" }, { Allow: "GET,POST,OPTIONS" });
+      if (req.method !== "POST") return json(res, 405, { error: "Method not allowed" }, { ...responseCors, Allow: "GET,POST,OPTIONS" });
       try {
         const body = await readBody(req);
         const linked = await linkFplAccount(auth.userId, Number(body.fplId));
@@ -244,22 +246,34 @@ const gateway = http.createServer(async (req, res) => {
     }
 
     if (url.pathname === "/api/calculator/usage") {
-      if (req.method !== "GET") return json(res, 405, { error: "Method not allowed" }, { Allow: "GET,OPTIONS" });
-      return json(res, 200, await getUsage(auth.userId), cors(origin));
+      if (req.method !== "GET") return json(res, 405, { error: "Method not allowed" }, { ...responseCors, Allow: "GET,OPTIONS" });
+      const paid = !isOwner(auth.userId) && await isPaidUser(auth.userId);
+      return json(res, 200, paid
+        ? { used: 0, remaining: null, limit: null, unlimited: true, paid: true }
+        : { ...await getUsage(auth.userId), paid: false }, responseCors);
     }
 
     if (url.pathname === "/api/calculator/templates") {
-      if (req.method !== "GET") return json(res, 405, { error: "Method not allowed" }, { Allow: "GET,OPTIONS" });
-      try { return json(res, 200, await getTopFiveForUser(auth.userId), cors(origin)); }
+      if (req.method !== "GET") return json(res, 405, { error: "Method not allowed" }, { ...responseCors, Allow: "GET,OPTIONS" });
+      try { return json(res, 200, await getTopFiveForUser(auth.userId), responseCors); }
       catch (error) { return json(res, error.status || 400, { error: error.message, code: error.code || "CALCULATOR_ERROR" }, cors(origin)); }
     }
 
+    if (url.pathname === "/api/calculator/players") {
+      if (req.method !== "GET") return json(res, 405, { error: "Method not allowed" }, { ...responseCors, Allow: "GET,OPTIONS" });
+      try { return json(res, 200, { players: await getAllPlayers() }, responseCors); }
+      catch (error) { return json(res, 502, { error: "Failed to load FPL players.", code: "PLAYERS_LOAD_ERROR" }, responseCors); }
+    }
+
     if (url.pathname === "/api/calculator/analyze") {
-      if (req.method !== "POST") return json(res, 405, { error: "Method not allowed" }, { Allow: "POST,OPTIONS" });
-      let trial;
-      try { trial = await consumeTrial(auth.userId); }
-      catch { return json(res, 503, { error: "Usage enforcement is temporarily unavailable." }); }
-      if (!trial.allowed) return json(res, 429, { error: "Free analysis limit reached for this gameweek.", code: "GAMEWEEK_TRIAL_LIMIT", used: trial.used, remaining: 0, limit: TRIAL_LIMIT, gameweek: trial.gameweek, resetsAt: trial.deadline.toISOString() }, { "Retry-After": String(Math.max(1, Math.ceil((trial.deadline.getTime() - Date.now()) / 1000))) });
+      if (req.method !== "POST") return json(res, 405, { error: "Method not allowed" }, { ...responseCors, Allow: "POST,OPTIONS" });
+      const paid = !isOwner(auth.userId) && await isPaidUser(auth.userId);
+      let trial = null;
+      if (!paid && !isOwner(auth.userId)) {
+        try { trial = await consumeTrial(auth.userId); }
+        catch { return json(res, 503, { error: "Usage enforcement is temporarily unavailable." }, responseCors); }
+        if (!trial.allowed) return json(res, 429, { error: "Free analysis limit reached for this gameweek.", code: "GAMEWEEK_TRIAL_LIMIT", used: trial.used, remaining: 0, limit: TRIAL_LIMIT, gameweek: trial.gameweek, resetsAt: trial.deadline.toISOString() }, { ...responseCors, "Retry-After": String(Math.max(1, Math.ceil((trial.deadline.getTime() - Date.now()) / 1000)))});
+      }
       try {
         const body = await readBody(req);
         const result = await analyzeRiskForUser(auth.userId, {
@@ -290,19 +304,21 @@ const gateway = http.createServer(async (req, res) => {
       return json(
         res,
         200,
-        { ...result, usage: await getUsage(auth.userId) },
-        cors(origin)
+        { ...result, usage: paid || isOwner(auth.userId)
+          ? { used: 0, remaining: null, limit: null, unlimited: true, paid }
+          : { ...await getUsage(auth.userId), paid: false } },
+        responseCors
       );
       } catch (error) {
-        await refundTrial(auth.userId, trial.gameweek);
-        return json(res, error.status || 400, { error: error.message, code: error.code || "CALCULATOR_ERROR" }, cors(origin));
+        if (trial?.allowed) await refundTrial(auth.userId, trial.gameweek);
+        return json(res, error.status || 400, { error: error.message, code: error.code || "CALCULATOR_ERROR" }, responseCors);
       }
     }
 
-    return json(res, 404, { error: "Not found" }, cors(origin));
+    return json(res, 404, { error: "Not found" }, responseCors);
   } catch (error) {
     console.error("GATEWAY ERROR:", error.message);
-    if (!res.headersSent) json(res, 500, { error: "Internal server error." });
+    if (!res.headersSent) json(res, 500, { error: "Internal server error." }, cors(req.headers.origin));
     else res.end();
   }
 });
