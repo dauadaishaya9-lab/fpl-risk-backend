@@ -1,7 +1,8 @@
 import http from "node:http";
 import crypto from "node:crypto";
 import pg from "pg";
-import {
+import { estimateRankImpact, isRankImpactEntitled } from "./rank-impact.js";
+import { isOwner,
   analyzeRiskForUser,
   getTopFiveForUser,
   getUsage,
@@ -268,7 +269,30 @@ const gateway = http.createServer(async (req, res) => {
           tripleCaptain: body.tripleCaptain,
           expectedPoints: Number(body.expectedPoints)
         });
-        return json(res, 200, { ...result, usage: await getUsage(auth.userId) }, cors(origin));
+        if (await isRankImpactEntitled(auth.userId, isOwner)) {
+        try {
+          const fpl = await getLinkedFplId(auth.userId);
+
+          if (fpl) {
+            result.rankImpact = await estimateRankImpact({
+              fplId: fpl.fplId,
+              relativeSwing: result.relativeSwing,
+              gameweek: result.gameweek,
+              tierName: result.tier.name
+            });
+          }
+        } catch (error) {
+          console.error("RANK IMPACT ESTIMATION FAILED:", error.message);
+          result.rankImpact = null;
+        }
+      }
+
+      return json(
+        res,
+        200,
+        { ...result, usage: await getUsage(auth.userId) },
+        cors(origin)
+      );
       } catch (error) {
         await refundTrial(auth.userId, trial.gameweek);
         return json(res, error.status || 400, { error: error.message, code: error.code || "CALCULATOR_ERROR" }, cors(origin));

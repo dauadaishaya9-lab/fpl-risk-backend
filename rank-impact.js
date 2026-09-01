@@ -112,73 +112,394 @@ function localSlopes(points, samples) {
   return slopes.filter(Number.isFinite).filter(v => v > 0);
 }
 
-export async function estimateRankImpact({ fplId, relativeSwing, gameweek, tierName }) {
+export async function estimateRankImpact({
+  fplId,
+  relativeSwing,
+  gameweek,
+  tierName
+}) {
   if (!pool) throw new Error("DATABASE_URL is required");
-  if (!Number.isSafeInteger(fplId) || fplId <= 0) throw new Error("Invalid FPL Team ID");
-  if (!Number.isFinite(relativeSwing)) throw new Error("Invalid relative swing");
-  if (!Number.isSafeInteger(gameweek) || gameweek <= 0) throw new Error("Invalid snapshot gameweek");
-  if (typeof tierName !== "string" || !tierName) throw new Error("Invalid snapshot tier");
+  if (!Number.isSafeInteger(fplId) || fplId <= 0)
+    throw new Error("Invalid FPL Team ID");
+  if (!Number.isFinite(relativeSwing))
+    throw new Error("Invalid relative swing");
+  if (!Number.isSafeInteger(gameweek) || gameweek <= 0)
+    throw new Error("Invalid snapshot gameweek");
+  if (typeof tierName !== "string" || !tierName)
+    throw new Error("Invalid snapshot tier");
 
   const snapshotResult = await pool.query(
-    `SELECT gameweek, season, deadline, picks_captured_at
-       FROM fpl_gameweeks
-      WHERE gameweek=$1 AND status='complete'
-      LIMIT 1`,
+    `
+      SELECT gameweek, season, deadline, picks_captured_at
+      FROM fpl_gameweeks
+      WHERE gameweek=$1
+        AND status='complete'
+      LIMIT 1
+    `,
     [gameweek]
   );
+
   const snapshot = snapshotResult.rows[0];
-  if (!snapshot) throw new Error("Requested risk snapshot is not complete");
+
+  if (!snapshot)
+    throw new Error("Requested risk snapshot is not complete");
 
   const history = await fetchJSON(`${ENTRY_URL}${fplId}/history/`);
-  const historyRow = (history.current || []).find(row => Number(row.event) === gameweek);
-  if (!historyRow) throw new Error("User snapshot history unavailable");
 
-  const snapshotRank = Number(historyRow.overall_rank);
-  const snapshotPoints = Number(historyRow.total_points);
-  if (!Number.isSafeInteger(snapshotRank) || snapshotRank < 1) throw new Error("User snapshot rank unavailable");
-  if (!Number.isFinite(snapshotPoints)) throw new Error("User snapshot points unavailable");
+  const historyRow = (history.current || []).find(
+    row => Number(row.event) === gameweek
+  );
+
+  if (!historyRow)
+    throw new Error("User snapshot history unavailable");
+
+  const currentRank = Number(historyRow.overall_rank);
+  const currentPoints = Number(historyRow.total_points);
+
+  if (!Number.isSafeInteger(currentRank) || currentRank < 1)
+    throw new Error("User snapshot rank unavailable");
+
+  if (!Number.isFinite(currentPoints))
+    throw new Error("User snapshot points unavailable");
 
   const result = await pool.query(
-    `SELECT locked_rank, overall_points_at_lock
-       FROM fpl_sample_managers
+    `
+      SELECT
+        locked_rank,
+        overall_points_at_lock
+      FROM fpl_sample_managers
       WHERE gameweek=$1
         AND locked_tier=$2
         AND overall_points_at_lock IS NOT NULL
         AND locked_rank IS NOT NULL
-      ORDER BY locked_rank ASC`,
+      ORDER BY locked_rank ASC
+    `,
     [gameweek, tierName]
   );
-  const samples = result.rows
-    .map(row => ({ rank: Number(row.locked_rank), points: Number(row.overall_points_at_lock) }))
-    .filter(row => Number.isSafeInteger(row.rank) && Number.isFinite(row.points));
-  if (samples.length < 3) throw new Error("Not enough sampled score data for rank-impact estimation");
 
-  const before = interpolateRank(snapshotPoints, samples);
-  const after = interpolateRank(snapshotPoints + relativeSwing, samples);
-  if (!Number.isFinite(before) || !Number.isFinite(after)) throw new Error("Unable to estimate rank impact from sampled score data");
+  const snapshotManagers = result.rows
+    .map(row => ({
+      rank: Number(row.locked_rank),
+      points: Number(row.overall_points_at_lock)
+    }))
+    .filter(
+      row =>
+        Number.isSafeInteger(row.rank) &&
+        row.rank >= 1 &&
+        Number.isFinite(row.points)
+    );
 
-  const places = before - after;
-  const slopes = localSlopes(snapshotPoints, samples);
-  const typicalSlope = slopes.length ? slopes.reduce((a, b) => a + b, 0) / slopes.length : Math.abs(places / (relativeSwing || 1));
-  const lowSlope = slopes.length ? Math.min(...slopes) : typicalSlope;
-  const highSlope = slopes.length ? Math.max(...slopes) : typicalSlope;
-  const magnitude = Math.abs(relativeSwing);
-  const low = Math.round(magnitude * lowSlope);
-  const high = Math.round(magnitude * highSlope);
+  if (snapshotManagers.length < 2)
+    throw new Error(
+      "Snapshot contains insufficient rank/points observations"
+    );
+
+  const rankTiers = [
+    { name: "1-1000000", min: 1, max: 1000000 },
+    { name: "1000001-2000000", min: 1000001, max: 2000000 },
+    { name: "2000001-3000000", min: 2000001, max: 3000000 },
+    { name: "3000001-4000000", min: 3000001, max: 4000000 },
+    { name: "4000001-5000000", min: 4000001, max: 5000000 },
+    { name: "5000001-6000000", min: 5000001, max: 6000000 },
+    { name: "6000001-7000000", min: 6000001, max: 7000000 },
+    { name: "7000001-8000000", min: 7000001, max: 8000000 },
+    { name: "8000001-9000000", min: 8000001, max: 9000000 },
+    { name: "9000001-10000000", min: 9000001, max: 10000000 }
+  ];
+
+  const boundaries = [
+    {
+      fromTier: "1-1000000",
+      toTier: "1000001-2000000",
+      boundaryRank: 1000001,
+      boundaryPoints: 75
+    },
+    {
+      fromTier: "1000001-2000000",
+      toTier: "2000001-3000000",
+      boundaryRank: 2000001,
+      boundaryPoints: 70
+    },
+    {
+      fromTier: "2000001-3000000",
+      toTier: "3000001-4000000",
+      boundaryRank: 3000001,
+      boundaryPoints: 65
+    },
+    {
+      fromTier: "3000001-4000000",
+      toTier: "4000001-5000000",
+      boundaryRank: 4000001,
+      boundaryPoints: 60
+    },
+    {
+      fromTier: "4000001-5000000",
+      toTier: "5000001-6000000",
+      boundaryRank: 5000001,
+      boundaryPoints: 55
+    },
+    {
+      fromTier: "5000001-6000000",
+      toTier: "6000001-7000000",
+      boundaryRank: 6000001,
+      boundaryPoints: 50
+    },
+    {
+      fromTier: "6000001-7000000",
+      toTier: "7000001-8000000",
+      boundaryRank: 7000001,
+      boundaryPoints: 45
+    },
+    {
+      fromTier: "7000001-8000000",
+      toTier: "8000001-9000000",
+      boundaryRank: 8000001,
+      boundaryPoints: 40
+    },
+    {
+      fromTier: "8000001-9000000",
+      toTier: "9000001-10000000",
+      boundaryRank: 9000001,
+      boundaryPoints: 35
+    }
+  ];
+
+  const rows = snapshotManagers
+    .map(row => ({
+      rank: Number(row.rank),
+      points: Number(row.points)
+    }))
+    .filter(
+      row =>
+        Number.isSafeInteger(row.rank) &&
+        row.rank >= 1 &&
+        Number.isFinite(row.points)
+    )
+    .sort((a, b) => a.points - b.points);
+
+  const tiers = rankTiers
+    .filter(t => Number.isSafeInteger(t.min) && Number.isSafeInteger(t.max))
+    .sort((a, b) => a.min - b.min);
+
+  const currentTier =
+    tiers.find(
+      tier =>
+        currentRank >= tier.min &&
+        currentRank <= tier.max
+    ) ||
+    tiers.find(tier => tier.name === tierName);
+
+  if (!currentTier)
+    throw new Error("Could not determine current rank tier");
+
+  function findBoundary(betterTier, worseTier) {
+    return boundaries.find(
+      boundary =>
+        boundary.fromTier === betterTier.name &&
+        boundary.toTier === worseTier.name &&
+        Number.isFinite(Number(boundary.boundaryPoints))
+    ) || null;
+  }
+
+  function rankAtPoints(targetPoints) {
+    if (rows.length < 2) return null;
+
+    if (targetPoints <= rows[0].points)
+      return rows[0].rank;
+
+    const last = rows[rows.length - 1];
+
+    if (targetPoints >= last.points)
+      return last.rank;
+
+    for (let i = 1; i < rows.length; i++) {
+      const lower = rows[i - 1];
+      const upper = rows[i];
+
+      if (targetPoints <= upper.points) {
+        if (upper.points === lower.points) {
+          return Math.round(
+            (lower.rank + upper.rank) / 2
+          );
+        }
+
+        const ratio =
+          (targetPoints - lower.points) /
+          (upper.points - lower.points);
+
+        return Math.round(
+          lower.rank +
+          ratio * (upper.rank - lower.rank)
+        );
+      }
+    }
+
+    return last.rank;
+  }
+
+  const projectedPoints =
+    Number((currentPoints + relativeSwing).toFixed(2));
+
+  const direction =
+    relativeSwing > 0
+      ? "up"
+      : relativeSwing < 0
+        ? "down"
+        : "unchanged";
+
+  if (relativeSwing === 0) {
+    return {
+      currentRank,
+      currentPoints,
+      pointSwing: relativeSwing,
+      projectedPoints,
+      estimatedRank: currentRank,
+      estimatedRankMovement: 0,
+      direction: "unchanged",
+      rankTier: currentTier.name,
+      finalTier: currentTier.name,
+      boundaryLowerLimit: null,
+      boundaryDistance: 0,
+      tiersCrossed: [],
+      sampleSize: rows.length,
+      gameweek: Number(snapshot.gameweek),
+      season: snapshot.season
+    };
+  }
+
+  let finalTier = currentTier;
+  const tiersCrossed = [];
+
+  if (direction === "up") {
+    let currentIndex = tiers.findIndex(
+      tier => tier.name === currentTier.name
+    );
+
+    while (currentIndex > 0) {
+      const betterTier = tiers[currentIndex - 1];
+      const worseTier = tiers[currentIndex];
+      const boundary = findBoundary(
+        betterTier,
+        worseTier
+      );
+
+      if (!boundary) break;
+
+      const boundaryPoints =
+        Number(boundary.boundaryPoints);
+
+      if (projectedPoints < boundaryPoints)
+        break;
+
+      tiersCrossed.push({
+        fromTier: worseTier.name,
+        toTier: betterTier.name,
+        boundaryRank: Number(
+          boundary.boundaryRank ?? worseTier.min
+        ),
+        boundaryLowerLimit:
+          Number(boundaryPoints.toFixed(4)),
+        boundaryDistance:
+          Number(
+            Math.max(
+              0,
+              boundaryPoints - currentPoints
+            ).toFixed(4)
+          )
+      });
+
+      finalTier = betterTier;
+      currentIndex--;
+    }
+  }
+
+  if (direction === "down") {
+    let currentIndex = tiers.findIndex(
+      tier => tier.name === currentTier.name
+    );
+
+    while (currentIndex < tiers.length - 1) {
+      const betterTier = tiers[currentIndex];
+      const worseTier = tiers[currentIndex + 1];
+      const boundary = findBoundary(
+        betterTier,
+        worseTier
+      );
+
+      if (!boundary) break;
+
+      const boundaryPoints =
+        Number(boundary.boundaryPoints);
+
+      if (projectedPoints > boundaryPoints)
+        break;
+
+      tiersCrossed.push({
+        fromTier: betterTier.name,
+        toTier: worseTier.name,
+        boundaryRank: Number(
+          boundary.boundaryRank ?? worseTier.min
+        ),
+        boundaryLowerLimit:
+          Number(boundaryPoints.toFixed(4)),
+        boundaryDistance:
+          Number(
+            Math.max(
+              0,
+              currentPoints - boundaryPoints
+            ).toFixed(4)
+          )
+      });
+
+      finalTier = worseTier;
+      currentIndex++;
+    }
+  }
+
+  const terminalRows = rows.filter(
+    row =>
+      row.rank >= finalTier.min &&
+      row.rank <= finalTier.max
+  );
+
+  const rankingRows =
+    terminalRows.length >= 2
+      ? terminalRows
+      : rows;
+
+  const estimatedRank =
+    rankAtPoints(projectedPoints) ?? currentRank;
+
+  const estimatedRankMovement =
+    currentRank - estimatedRank;
+
+  const lastCrossing =
+    tiersCrossed[tiersCrossed.length - 1] ?? null;
 
   return {
-    currentRank: snapshotRank,
-    currentPoints: snapshotPoints,
-    snapshotRank,
-    snapshotPoints,
-    relativeSwing: Number(relativeSwing.toFixed(2)),
-    estimatedPlaces: Math.round(places),
-    estimatedRank: Math.max(1, Math.round(snapshotRank - places)),
-    range: { low: Math.min(low, high), high: Math.max(low, high) },
-    sampleSize: samples.length,
+    currentRank,
+    currentPoints,
+    pointSwing: Number(relativeSwing.toFixed(2)),
+    projectedPoints,
+    estimatedRank,
+    estimatedRankMovement,
+    direction,
+    rankTier: currentTier.name,
+    finalTier: finalTier.name,
+    boundaryLowerLimit:
+      lastCrossing?.boundaryLowerLimit ?? null,
+    boundaryDistance:
+      lastCrossing?.boundaryDistance ?? 0,
+    tiersCrossed,
+    sampleSize: rankingRows.length,
     gameweek: Number(snapshot.gameweek),
     season: snapshot.season,
-    snapshot: { deadline: snapshot.deadline, picksCapturedAt: snapshot.picks_captured_at },
-    method: "snapshot-consistent local score-to-rank interpolation from sampled managers",
+    snapshot: {
+      deadline: snapshot.deadline,
+      picksCapturedAt: snapshot.picks_captured_at
+    },
+    method:
+      "snapshot-consistent score-to-rank interpolation with point-based tier boundaries"
   };
 }
+
