@@ -128,7 +128,10 @@ async function recoverBand({ band, season, gameweek, totalManagers }) {
 
   candidates.sort((a, b) => Number(a.last_rank) - Number(b.last_rank) || Number(a.entry) - Number(b.entry));
   const selected = candidates.slice(0, band.sampleSize);
-  if (selected.length < band.sampleSize) throw new Error(`Recovery could only find ${selected.length}/${band.sampleSize} GW ${gameweek} managers for ${band.name}`);
+  if (selected.length < band.sampleSize) {
+    console.log(`GW ${gameweek} recovery ${band.name}: insufficient managers ${selected.length}/${band.sampleSize}; ignoring this tier and all later tiers.`);
+    return [];
+  }
 
   const recovered = [];
   for (const manager of selected) {
@@ -184,9 +187,11 @@ export async function recoverMissedSnapshot() {
     const bands=getBands(Number(bootstrap.total_players)||0);
     for (const band of bands) {
       const rows = await recoverBand({ band, season, gameweek: Number(target.id), totalManagers: Number(bootstrap.total_players) || 0 });
+      if (rows.length < band.sampleSize) break;
       recovered.push(...rows);
       console.log(`GW ${target.id} recovery ${band.name}: ${rows.length}/${band.sampleSize} managers verified.`);
     }
+    if (!recovered.length) throw new Error("No rank tier had enough managers to start the recovered snapshot.");
 
     await pool.query(`INSERT INTO fpl_gameweeks(gameweek,season,deadline,lock_time,total_managers,status,locked_at,picks_captured_at) VALUES($1,$2,$3,$4,$5,'complete',NOW(),NOW()) ON CONFLICT(gameweek) DO UPDATE SET season=EXCLUDED.season,deadline=EXCLUDED.deadline,lock_time=EXCLUDED.lock_time,total_managers=EXCLUDED.total_managers,status='complete',locked_at=COALESCE(fpl_gameweeks.locked_at,NOW()),picks_captured_at=COALESCE(fpl_gameweeks.picks_captured_at,NOW())`, [Number(target.id), season, deadline, new Date(deadline.getTime() - LOCK_HOURS_BEFORE_DEADLINE * 60 * 60 * 1000), Number(bootstrap.total_players) || 0]);
 
@@ -195,7 +200,7 @@ export async function recoverMissedSnapshot() {
     }
 
     await pool.query(`DELETE FROM fpl_sample_managers WHERE gameweek < $1`, [Number(target.id)]);
-    console.log(`GW ${target.id} RECOVERY COMPLETE: latest finished gameweek published as the new risk snapshot.`);
+    console.log(`GW ${target.id} RECOVERY COMPLETE: latest finished gameweek published as the new risk snapshot through the last complete tier.`);
   } catch (error) {
     await pool.query(`DELETE FROM fpl_sample_managers WHERE gameweek=$1`, [Number(target.id)]);
     await pool.query(`DELETE FROM fpl_gameweeks WHERE gameweek=$1 AND status='complete' AND picks_captured_at IS NOT NULL`, [Number(target.id)]);
