@@ -1,6 +1,7 @@
 import http from "node:http";
 import pg from "pg";
 import { deterministicRanks, standingsPageForRank } from "./sampling.js";
+import { fetchJSON } from "./fpl-fetch.js";
 
 const { Pool } = pg;
 const PORT = process.env.PORT || 3000;
@@ -8,8 +9,9 @@ const DATABASE_URL = process.env.DATABASE_URL;
 const FPL_URL = "https://fantasy.premierleague.com/api/bootstrap-static/";
 const ENTRY_URL = "https://fantasy.premierleague.com/api/entry/";
 const STANDINGS_URL = "https://fantasy.premierleague.com/api/leagues-classic/314/standings/";
-const REFRESH_INTERVAL = 5 * 60 * 1000;
 const LOCK_HOURS_BEFORE_DEADLINE = 1;
+const PICK_CAPTURE_DELAY_MS = 60 * 60 * 1000;
+const PICK_RETRY_DELAY_MS = 60 * 1000;
 const FPL_CACHE_TTL = 2 * 60 * 1000;
 const FIXED_BANDS = [
   { name:"1-10000", min:1, max:10000, sampleSize:10 },
@@ -23,9 +25,10 @@ const MILLION_BAND_START = 1000001;
 const MILLION_BAND_SIZE = 1000000;
 const MILLION_BAND_SAMPLE_SIZE = 60;
 const pool = DATABASE_URL ? new Pool({ connectionString:DATABASE_URL, ssl:{rejectUnauthorized:false}, max:5, idleTimeoutMillis:30000, connectionTimeoutMillis:10000 }) : null;
-const runtime = { refreshing:false, lastRefreshAttempt:null, lastSuccessfulRefresh:null, lastError:null };
+const runtime = { refreshing:false, lastRefreshAttempt:null, lastSuccessfulRefresh:null, lastError:null, nextScheduledRun:null };
 let fplCache = { data:null, expiresAt:0 };
 let schedulerStarted = false;
+let schedulerTimer = null;
 
 function getSeasonLabel(date=new Date()) { const year=date.getUTCMonth()>=6?date.getUTCFullYear():date.getUTCFullYear()-1; return `${year}/${String(year+1).slice(-2)}`; }
 function getSamplingBands(totalManagers) {
@@ -40,10 +43,9 @@ function getSamplingBands(totalManagers) {
   return bands;
 }
 function sendJSON(res,status,data,extraHeaders={}) { res.writeHead(status,{"Content-Type":"application/json; charset=utf-8","Cache-Control":"no-store",...extraHeaders}); res.end(JSON.stringify(data)); }
-async function fetchJSON(url,timeoutMs=15000) { const controller=new AbortController(); const timeout=setTimeout(()=>controller.abort(),timeoutMs); try { const response=await fetch(url,{signal:controller.signal,headers:{"User-Agent":"FPL-Risk-Calculator/1.0"}}); if(!response.ok) throw new Error(`HTTP ${response.status}`); return await response.json(); } finally { clearTimeout(timeout); } }
-async function getFPLData() { const now=Date.now(); if(fplCache.data&&now<fplCache.expiresAt)return fplCache.data; const data=await fetchJSON(FPL_URL,20000); fplCache={data,expiresAt:now+FPL_CACHE_TTL}; return data; }
+async function getFPLData() { const now=Date.now(); if(fplCache.data&&now<fplCache.expiresAt)return fplCache.data; const data=await fetchJSON(FPL_URL,20000,{label:"bootstrap-static"}); fplCache={data,expiresAt:now+FPL_CACHE_TTL}; return data; }
 function getEvent(data,gameweek){ return data.events.find(event=>event.id===gameweek)||null; }
-async function getStandingsPage(page){ return fetchJSON(`${STANDINGS_URL}?page_standings=${page}`); }
+async function getStandingsPage(page){ return fetchJSON(`${STANDINGS_URL}?page_standings=${page}`,20000,{label:`standings page ${page}`}); }
 
 async function getSampleManagersForBand(band,totalManagers,season,gameweek) {
   const maxRank=band.max===Infinity?totalManagers:Math.min(band.max,totalManagers); if(maxRank<band.min)return [];
@@ -52,7 +54,7 @@ async function getSampleManagersForBand(band,totalManagers,season,gameweek) {
   for(const rank of ranks){ const page=standingsPageForRank(rank); if(pages.has(page))continue; try { const data=await getStandingsPage(page); pages.set(page,data.standings?.results||[]); } catch(error) { console.error(`Failed standings page ${page}:`,error.message); } }
   return ranks.map(requestedRank=>{ const page=standingsPageForRank(requestedRank); return pages.get(page)?.find(manager=>Number(manager.rank_sort)===requestedRank)||null; }).filter(Boolean);
 }
-async function getManagerPicks(managerId,gameweek){ return fetchJSON(`${ENTRY_URL}${managerId}/event/${gameweek}/picks/`,20000); }
+async function getManagerPicks(managerId,gameweek){ return fetchJSON(`${ENTRY_URL}${managerId}/event/${gameweek}/picks/`,20000,{label:`manager ${managerId} GW ${gameweek} picks`}); }
 
 async function initDatabase(){
   if(!pool)throw new Error("DATABASE_URL is not configured.");
@@ -140,9 +142,59 @@ function buildBandFromRows(band,rows){
   const n=managers.length; const pct=counts=>Object.fromEntries(Object.entries(counts).map(([id,c])=>[id,n?Number((c/n*100).toFixed(1)):0])); return {band:band.name,rankRange:{min:band.min,max:band.max},requestedSampleSize:band.sampleSize,successfulSampleSize:n,managers,ownership,ownershipPercent:pct(ownership),captaincy,captaincyPercent:pct(captaincy),tripleCaptaincy,tripleCaptainPercent:pct(tripleCaptaincy)};
 }
 async function getCompletedRiskData(){ const r=await pool.query(`SELECT gameweek,season,total_managers,created_at FROM fpl_gameweeks WHERE status='complete' ORDER BY gameweek DESC LIMIT 1`); if(!r.rowCount)return null; const gw=r.rows[0]; const bands=getSamplingBands(gw.total_managers); const rows=await pool.query(`SELECT gameweek,manager_id,locked_rank,locked_tier,manager_name,team_name,overall_points_at_lock,picks,active_chip,captain,triple_captain FROM fpl_sample_managers WHERE gameweek=$1 AND picks IS NOT NULL ORDER BY locked_rank ASC`,[gw.gameweek]); const completedBands=bands.map(b=>({band:b,rows:rows.rows.filter(r=>r.locked_rank>=b.min&&r.locked_rank<=b.max)})).filter(x=>x.rows.length>0); return {season:gw.season,gameweek:gw.gameweek,totalManagers:gw.total_managers,bands:completedBands.map(x=>buildBandFromRows(x.band,x.rows)),createdAt:gw.created_at,samplingPolicy:{lockHoursBeforeDeadline:LOCK_HOURS_BEFORE_DEADLINE,rankSource:"overall standings at lock time",picksSource:"manager GW picks after deadline",sampling:"deterministic random rank positions; 60 managers per million-rank band from 1,000,001 onward; collection stops at the last tier with a complete requested manager sample"}}; }
-async function refreshScheduler(){ if(runtime.refreshing||!pool)return; runtime.refreshing=true; runtime.lastRefreshAttempt=new Date().toISOString(); try{ const fplData=await getFPLData(); const scheduleReady=await saveGameweekSchedule(fplData); if(!scheduleReady){runtime.lastSuccessfulRefresh=new Date().toISOString();runtime.lastError=null;return;} for(const event of fplData.events){ if(!event.deadline_time)continue; const deadline=new Date(event.deadline_time); const lockTime=new Date(deadline.getTime()-LOCK_HOURS_BEFORE_DEADLINE*60*60*1000); if(Date.now()>=lockTime.getTime()&&Date.now()<deadline.getTime()){try{await lockGameweekSamples(event.id,fplData);}catch(error){console.error(`GW ${event.id} LOCK FAILED:`,error.message);}} } const locked=await pool.query(`SELECT gameweek FROM fpl_gameweeks WHERE status='locked' AND deadline<=NOW() ORDER BY gameweek ASC`); for(const row of locked.rows){try{await captureGameweekPicks(row.gameweek);}catch(error){console.error(`GW ${row.gameweek} PICK CAPTURE FAILED:`,error.message);}} runtime.lastSuccessfulRefresh=new Date().toISOString();runtime.lastError=null; }catch(error){runtime.lastError=error.message;console.error("SCHEDULER FAILED:",error.message);}finally{runtime.refreshing=false;} }
-export function startScheduler(){ if(schedulerStarted||!pool)return; schedulerStarted=true; refreshScheduler().catch(error=>console.error("BACKGROUND SCHEDULER FAILED:",error.message)); setInterval(()=>refreshScheduler().catch(error=>console.error("BACKGROUND SCHEDULER FAILED:",error.message)),REFRESH_INTERVAL); }
-const server=http.createServer(async(req,res)=>{ const url=new URL(req.url,`http://${req.headers.host||"localhost"}`); if(req.method!=="GET"){sendJSON(res,405,{error:"Method not allowed"},{Allow:"GET"});return;} if(url.pathname==="/"){let databaseReady=false;try{if(pool){await pool.query("SELECT 1");databaseReady=true;}}catch{} sendJSON(res,200,{status:"ok",databaseConfigured:Boolean(pool),databaseReady,refreshing:runtime.refreshing,lastRefreshAttempt:runtime.lastRefreshAttempt,lastSuccessfulRefresh:runtime.lastSuccessfulRefresh,lastError:runtime.lastError,lockHoursBeforeDeadline:LOCK_HOURS_BEFORE_DEADLINE});return;} if(url.pathname==="/api/sample-tiers"){try{const result=await getCompletedRiskData();if(!result){sendJSON(res,503,{error:"No completed locked sample is ready yet."});return;}sendJSON(res,200,result);}catch(error){sendJSON(res,500,{error:"Could not load risk data.",details:error.message});}return;} if(url.pathname==="/api/cache"){if(!pool){sendJSON(res,503,{error:"PostgreSQL is not configured."});return;}try{const result=await pool.query(`SELECT gameweek,season,status,deadline,lock_time,locked_at,picks_captured_at,total_managers FROM fpl_gameweeks ORDER BY gameweek DESC`);sendJSON(res,200,{lockHoursBeforeDeadline:LOCK_HOURS_BEFORE_DEADLINE,gameweeks:result.rows,scheduler:runtime});}catch(error){sendJSON(res,500,{error:error.message});}return;} if(url.pathname.startsWith("/api/entry/")){const entryId=url.pathname.split("/api/entry/")[1];if(!entryId||!/^[0-9]+$/.test(entryId)){sendJSON(res,400,{error:"Invalid FPL ID"});return;}try{const data=await fetchJSON(`${ENTRY_URL}${entryId}/`);sendJSON(res,200,{id:data.id,playerName:`${data.player_first_name} ${data.player_last_name}`,teamName:data.name,overallRank:data.summary_overall_rank,overallPoints:data.summary_overall_points});}catch(error){sendJSON(res,502,{error:"Could not fetch FPL entry",details:error.message});}return;} if(url.pathname==="/api/fpl"){try{sendJSON(res,200,await getFPLData(),{"Cache-Control":"public, max-age=60"});}catch(error){sendJSON(res,502,{error:error.message});}return;} sendJSON(res,404,{error:"Not found"}); });
+
+function clearSchedulerTimer(){ if(schedulerTimer){clearTimeout(schedulerTimer);schedulerTimer=null;} runtime.nextScheduledRun=null; }
+async function scheduleNextRun(){
+  if(!pool||!schedulerStarted)return;
+  clearSchedulerTimer();
+  try{
+    const result=await pool.query(`SELECT gameweek,status,lock_time,deadline,CASE WHEN status='pending' THEN lock_time ELSE deadline + INTERVAL '1 hour' END AS run_at FROM fpl_gameweeks WHERE (status='pending' OR status='locked') ORDER BY run_at ASC LIMIT 1`);
+    if(!result.rowCount)return;
+    const row=result.rows[0];
+    const target=new Date(row.run_at).getTime();
+    const now=Date.now();
+    const delay=Math.max(1000,Math.min(target-now,2147483647));
+    const scheduledAt=new Date(now+delay);
+    runtime.nextScheduledRun=scheduledAt.toISOString();
+    console.log(`SCHEDULER: next GW ${row.gameweek} ${row.status} run scheduled for ${scheduledAt.toISOString()}`);
+    schedulerTimer=setTimeout(()=>{schedulerTimer=null;refreshScheduler().catch(error=>console.error("BACKGROUND SCHEDULER FAILED:",error.message));},delay);
+  }catch(error){
+    runtime.lastError=error.message;
+    console.error("SCHEDULER NEXT-RUN CALCULATION FAILED:",error.message);
+  }
+}
+async function refreshScheduler(){
+  if(runtime.refreshing||!pool)return;
+  runtime.refreshing=true;
+  runtime.lastRefreshAttempt=new Date().toISOString();
+  try{
+    const fplData=await getFPLData();
+    const scheduleReady=await saveGameweekSchedule(fplData);
+    if(!scheduleReady){runtime.lastSuccessfulRefresh=new Date().toISOString();runtime.lastError=null;return;}
+    for(const event of fplData.events){
+      if(!event.deadline_time)continue;
+      const deadline=new Date(event.deadline_time);
+      const lockTime=new Date(deadline.getTime()-LOCK_HOURS_BEFORE_DEADLINE*60*60*1000);
+      if(Date.now()>=lockTime.getTime()&&Date.now()<deadline.getTime()){
+        try{await lockGameweekSamples(event.id,fplData);}catch(error){console.error(`GW ${event.id} LOCK FAILED:`,error.message);}
+      }
+    }
+    const locked=await pool.query(`SELECT gameweek,deadline FROM fpl_gameweeks WHERE status='locked' AND deadline + INTERVAL '1 hour' <= NOW() ORDER BY gameweek ASC`);
+    for(const row of locked.rows){
+      try{await captureGameweekPicks(row.gameweek);}catch(error){console.error(`GW ${row.gameweek} PICK CAPTURE FAILED:`,error.message);}
+    }
+    runtime.lastSuccessfulRefresh=new Date().toISOString();
+    runtime.lastError=null;
+  }catch(error){
+    runtime.lastError=error.message;
+    console.error("SCHEDULER FAILED:",error.message);
+  }finally{
+    runtime.refreshing=false;
+    await scheduleNextRun();
+  }
+}
+export function startScheduler(){ if(schedulerStarted||!pool)return; schedulerStarted=true; refreshScheduler().catch(error=>console.error("BACKGROUND SCHEDULER FAILED:",error.message)); }
+const server=http.createServer(async(req,res)=>{ const url=new URL(req.url,`http://${req.headers.host||"localhost"}`); if(req.method!=="GET"){sendJSON(res,405,{error:"Method not allowed"},{Allow:"GET"});return;} if(url.pathname==="/"){let databaseReady=false;try{if(pool){await pool.query("SELECT 1");databaseReady=true;}}catch{} sendJSON(res,200,{status:"ok",databaseConfigured:Boolean(pool),databaseReady,refreshing:runtime.refreshing,lastRefreshAttempt:runtime.lastRefreshAttempt,lastSuccessfulRefresh:runtime.lastSuccessfulRefresh,lastError:runtime.lastError,nextScheduledRun:runtime.nextScheduledRun,lockHoursBeforeDeadline:LOCK_HOURS_BEFORE_DEADLINE,pickCaptureDelayMinutes:PICK_CAPTURE_DELAY_MS/60000});return;} if(url.pathname==="/api/sample-tiers"){try{const result=await getCompletedRiskData();if(!result){sendJSON(res,503,{error:"No completed locked sample is ready yet."});return;}sendJSON(res,200,result);}catch(error){sendJSON(res,500,{error:"Could not load risk data.",details:error.message});}return;} if(url.pathname==="/api/cache"){if(!pool){sendJSON(res,503,{error:"PostgreSQL is not configured."});return;}try{const result=await pool.query(`SELECT gameweek,season,status,deadline,lock_time,locked_at,picks_captured_at,total_managers FROM fpl_gameweeks ORDER BY gameweek DESC`);sendJSON(res,200,{lockHoursBeforeDeadline:LOCK_HOURS_BEFORE_DEADLINE,pickCaptureDelayMinutes:PICK_CAPTURE_DELAY_MS/60000,gameweeks:result.rows,scheduler:runtime});}catch(error){sendJSON(res,500,{error:error.message});}return;} if(url.pathname.startsWith("/api/entry/")){const entryId=url.pathname.split("/api/entry/")[1];if(!entryId||!/^[0-9]+$/.test(entryId)){sendJSON(res,400,{error:"Invalid FPL ID"});return;}try{const data=await fetchJSON(`${ENTRY_URL}${entryId}/`,20000,{label:`entry ${entryId}`});sendJSON(res,200,{id:data.id,playerName:`${data.player_first_name} ${data.player_last_name}`,teamName:data.name,overallRank:data.summary_overall_rank,overallPoints:data.summary_overall_points});}catch(error){sendJSON(res,502,{error:"Could not fetch FPL entry",details:error.message});}return;} if(url.pathname==="/api/fpl"){try{sendJSON(res,200,await getFPLData(),{"Cache-Control":"public, max-age=60"});}catch(error){sendJSON(res,502,{error:error.message});}return;} sendJSON(res,404,{error:"Not found"}); });
 async function start(){
   server.listen(PORT,"127.0.0.1",()=>{console.log(`Internal backend listening on loopback port ${PORT}; scheduler will initialize in background.`);console.log(`Sample lock policy: ${LOCK_HOURS_BEFORE_DEADLINE} hour before deadline.`);console.log(`FPL bootstrap cache TTL: ${FPL_CACHE_TTL/1000}s.`);});
   if(pool){try{await initDatabase();console.log("PostgreSQL connected and schema ready.");if(process.env.DEFER_SCHEDULER!=="1")startScheduler();}catch(error){runtime.lastError=error.message;console.error("DATABASE STARTUP FAILED:",error.message);}}else console.error("DATABASE_URL is missing. PostgreSQL persistence is disabled.");
