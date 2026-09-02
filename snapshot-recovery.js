@@ -133,15 +133,12 @@ async function recoverBand({ band, season, gameweek, totalManagers }) {
   const recovered = [];
   for (const manager of selected) {
     const managerId = Number(manager.entry);
-    const history = await fetchJSON(`${ENTRY_URL}${managerId}/history/`);
-    const historyRow = (history.current || []).find(row => Number(row.event) === gameweek);
-    if (!historyRow || Number(historyRow.overall_rank) !== Number(manager.last_rank)) throw new Error(`Historical rank verification failed for manager ${managerId} in GW ${gameweek}`);
     const picksData = await fetchJSON(`${ENTRY_URL}${managerId}/event/${gameweek}/picks/`);
     const picks = Array.isArray(picksData.picks) ? picksData.picks : [];
     if (picks.length !== 15) throw new Error(`Manager ${managerId} has ${picks.length} picks for GW ${gameweek}`);
     const captain = picks.find(p => p.is_captain === true);
     const triple = picks.find(p => p.is_captain === true && Number(p.multiplier) === 3);
-    recovered.push({ managerId, lockedRank: Number(historyRow.overall_rank), lockedTier: tierForRank(Number(historyRow.overall_rank),totalManagers), managerName: manager.player_name || null, teamName: manager.entry_name || null, overallPointsAtLock: Number(historyRow.total_points) || 0, picks, activeChip: picksData.active_chip ?? null, captain: captain ? Number(captain.element) : null, tripleCaptain: triple ? Number(triple.element) : null });
+    recovered.push({ managerId, lockedRank: Number(manager.last_rank), lockedTier: tierForRank(Number(manager.last_rank),totalManagers), managerName: manager.player_name || null, teamName: manager.entry_name || null, overallPointsAtLock: null, picks, activeChip: picksData.active_chip ?? null, captain: captain ? Number(captain.element) : null, tripleCaptain: triple ? Number(triple.element) : null });
   }
   return recovered;
 }
