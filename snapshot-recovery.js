@@ -38,7 +38,7 @@ async function ensureSchema() {
   if (!pool) return;
   await pool.query(`
     CREATE TABLE IF NOT EXISTS fpl_gameweeks (
-      gameweek INTEGER PRIMARY KEY,
+      gameweek INTEGER PRIMARY KEY REFERENCES fpl_gameweeks(gameweek) ON DELETE CASCADE,
       season TEXT NOT NULL,
       deadline TIMESTAMPTZ NOT NULL,
       lock_time TIMESTAMPTZ NOT NULL,
@@ -155,44 +155,55 @@ async function recoverMissedSnapshot() {
   const current = events.find(event => event.is_current === true);
   if (!current) return;
 
-  const previous = events.filter(event => Number(event.id) < Number(current.id) && event.finished === true && event.data_checked === true).sort((a, b) => Number(b.id) - Number(a.id))[0];
-  if (!previous) return;
+  const finished = events
+    .filter(event => event.finished === true && event.data_checked === true && event.deadline_time)
+    .sort((a, b) => Number(b.id) - Number(a.id));
+  const target = finished[0];
+  if (!target) return;
 
   const season = seasonLabel();
   const complete = await pool.query(`SELECT 1 FROM fpl_gameweeks WHERE season=$1 AND status='complete' LIMIT 1`, [season]);
   if (complete.rowCount) return;
 
-  const existing = await pool.query(`SELECT gameweek,status FROM fpl_gameweeks WHERE season=$1 AND status IN ('locking','locked','complete') ORDER BY gameweek DESC`, [season]);
-  if (existing.rowCount) return;
+  // If the current GW already has rank collection underway, never fall back or rebuild an older GW.
+  const currentState = await pool.query(`SELECT status FROM fpl_gameweeks WHERE gameweek=$1`, [Number(current.id)]);
+  const currentSamples = await pool.query(`SELECT 1 FROM fpl_sample_managers WHERE gameweek=$1 LIMIT 1`, [Number(current.id)]);
+  if ((currentState.rowCount && ['locking','locked'].includes(currentState.rows[0].status)) || currentSamples.rowCount) {
+    console.log(`GW ${current.id} collection is already in progress; keeping the current collection and preserving the last published snapshot.`);
+    return;
+  }
 
-  const sampleRows = await pool.query(`SELECT 1 FROM fpl_sample_managers WHERE gameweek=$1 LIMIT 1`, [Number(previous.id)]);
+  const targetState = await pool.query(`SELECT status FROM fpl_gameweeks WHERE gameweek=$1`, [Number(target.id)]);
+  if (targetState.rowCount && ['locking','locked','complete'].includes(targetState.rows[0].status)) return;
+
+  const sampleRows = await pool.query(`SELECT 1 FROM fpl_sample_managers WHERE gameweek=$1 LIMIT 1`, [Number(target.id)]);
   if (sampleRows.rowCount) return;
 
-  const deadline = new Date(previous.deadline_time);
+  const deadline = new Date(target.deadline_time);
   if (!Number.isFinite(deadline.getTime()) || deadline.getTime() > Date.now()) return;
 
-  console.log(`GW ${previous.id} recovery: missed pre-deadline lock detected; rebuilding exactly one previous snapshot.`);
+  console.log(`GW ${target.id} recovery: no published snapshot and no active current-GW collection; rebuilding the latest finished gameweek.`);
   const recovered = [];
   try {
     const bands=getBands(Number(bootstrap.total_players)||0);
     for (const band of bands) {
-      const rows = await recoverBand({ band, season, gameweek: Number(previous.id), totalManagers: Number(bootstrap.total_players) || 0 });
+      const rows = await recoverBand({ band, season, gameweek: Number(target.id), totalManagers: Number(bootstrap.total_players) || 0 });
       recovered.push(...rows);
-      console.log(`GW ${previous.id} recovery ${band.name}: ${rows.length}/${band.sampleSize} managers verified.`);
+      console.log(`GW ${target.id} recovery ${band.name}: ${rows.length}/${band.sampleSize} managers verified.`);
     }
 
-    await pool.query(`INSERT INTO fpl_gameweeks(gameweek,season,deadline,lock_time,total_managers,status,locked_at,picks_captured_at) VALUES($1,$2,$3,$4,$5,'complete',NOW(),NOW()) ON CONFLICT(gameweek) DO UPDATE SET season=EXCLUDED.season,deadline=EXCLUDED.deadline,lock_time=EXCLUDED.lock_time,total_managers=EXCLUDED.total_managers,status='complete',locked_at=COALESCE(fpl_gameweeks.locked_at,NOW()),picks_captured_at=COALESCE(fpl_gameweeks.picks_captured_at,NOW())`, [Number(previous.id), season, deadline, new Date(deadline.getTime() - LOCK_HOURS_BEFORE_DEADLINE * 60 * 60 * 1000), Number(bootstrap.total_players) || 0]);
+    await pool.query(`INSERT INTO fpl_gameweeks(gameweek,season,deadline,lock_time,total_managers,status,locked_at,picks_captured_at) VALUES($1,$2,$3,$4,$5,'complete',NOW(),NOW()) ON CONFLICT(gameweek) DO UPDATE SET season=EXCLUDED.season,deadline=EXCLUDED.deadline,lock_time=EXCLUDED.lock_time,total_managers=EXCLUDED.total_managers,status='complete',locked_at=COALESCE(fpl_gameweeks.locked_at,NOW()),picks_captured_at=COALESCE(fpl_gameweeks.picks_captured_at,NOW())`, [Number(target.id), season, deadline, new Date(deadline.getTime() - LOCK_HOURS_BEFORE_DEADLINE * 60 * 60 * 1000), Number(bootstrap.total_players) || 0]);
 
     for (const row of recovered) {
-      await pool.query(`INSERT INTO fpl_sample_managers(gameweek,manager_id,locked_rank,locked_tier,manager_name,team_name,overall_points_at_lock,picks,active_chip,captain,triple_captain,picks_captured_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NOW()) ON CONFLICT(gameweek,manager_id) DO UPDATE SET locked_rank=EXCLUDED.locked_rank,locked_tier=EXCLUDED.locked_tier,manager_name=EXCLUDED.manager_name,team_name=EXCLUDED.team_name,overall_points_at_lock=EXCLUDED.overall_points_at_lock,picks=EXCLUDED.picks,active_chip=EXCLUDED.active_chip,captain=EXCLUDED.captain,triple_captain=EXCLUDED.triple_captain,picks_captured_at=NOW()`, [Number(previous.id), row.managerId, row.lockedRank, row.lockedTier, row.managerName, row.teamName, row.overallPointsAtLock, JSON.stringify(row.picks), row.activeChip, row.captain, row.tripleCaptain]);
+      await pool.query(`INSERT INTO fpl_sample_managers(gameweek,manager_id,locked_rank,locked_tier,manager_name,team_name,overall_points_at_lock,picks,active_chip,captain,triple_captain,picks_captured_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NOW()) ON CONFLICT(gameweek,manager_id) DO UPDATE SET locked_rank=EXCLUDED.locked_rank,locked_tier=EXCLUDED.locked_tier,manager_name=EXCLUDED.manager_name,team_name=EXCLUDED.team_name,overall_points_at_lock=EXCLUDED.overall_points_at_lock,picks=EXCLUDED.picks,active_chip=EXCLUDED.active_chip,captain=EXCLUDED.captain,triple_captain=EXCLUDED.triple_captain,picks_captured_at=NOW()`, [Number(target.id), row.managerId, row.lockedRank, row.lockedTier, row.managerName, row.teamName, row.overallPointsAtLock, JSON.stringify(row.picks), row.activeChip, row.captain, row.tripleCaptain]);
     }
 
-    await pool.query(`DELETE FROM fpl_sample_managers WHERE gameweek < $1`, [Number(previous.id)]);
-    console.log(`GW ${previous.id} RECOVERY COMPLETE: one completed risk snapshot created.`);
+    await pool.query(`DELETE FROM fpl_sample_managers WHERE gameweek < $1`, [Number(target.id)]);
+    console.log(`GW ${target.id} RECOVERY COMPLETE: latest finished gameweek published as the new risk snapshot.`);
   } catch (error) {
-    await pool.query(`DELETE FROM fpl_sample_managers WHERE gameweek=$1`, [Number(previous.id)]);
-    await pool.query(`DELETE FROM fpl_gameweeks WHERE gameweek=$1 AND status='complete' AND picks_captured_at IS NOT NULL`, [Number(previous.id)]);
-    console.error(`GW ${previous.id} recovery aborted; no snapshot published:`, error.message);
+    await pool.query(`DELETE FROM fpl_sample_managers WHERE gameweek=$1`, [Number(target.id)]);
+    await pool.query(`DELETE FROM fpl_gameweeks WHERE gameweek=$1 AND status='complete' AND picks_captured_at IS NOT NULL`, [Number(target.id)]);
+    console.error(`GW ${target.id} recovery aborted; no snapshot published:`, error.message);
   }
 }
 
