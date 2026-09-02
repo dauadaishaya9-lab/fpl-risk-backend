@@ -165,8 +165,15 @@ export async function recoverMissedSnapshot(){
 
   const season=seasonLabel();
   console.log(`RECOVERY TRACE: season = ${season}; checking for an existing complete snapshot.`);
-  const complete=await pool.query(`SELECT 1 FROM fpl_gameweeks WHERE season=$1 AND status='complete' LIMIT 1`,[season]);
+  const complete=await pool.query(`SELECT gameweek,season,status,deadline,lock_time,total_managers,locked_at,picks_captured_at,created_at FROM fpl_gameweeks WHERE season=$1 AND status='complete' ORDER BY gameweek DESC`,[season]);
   console.log(`RECOVERY TRACE: complete snapshot query returned ${complete.rowCount} row(s).`);
+  for(const row of complete.rows){
+    const counts=await pool.query(`SELECT locked_tier,COUNT(*)::int AS manager_count,COUNT(*) FILTER (WHERE picks IS NOT NULL)::int AS picks_count,COUNT(*) FILTER (WHERE picks IS NULL)::int AS missing_picks,COUNT(*) FILTER (WHERE jsonb_typeof(picks)='array' AND jsonb_array_length(picks)=15)::int AS valid_15_picks,COUNT(*) FILTER (WHERE picks IS NOT NULL AND (active_chip IS NOT NULL OR captain IS NOT NULL OR triple_captain IS NOT NULL))::int AS captain_chip_metadata_count FROM fpl_sample_managers WHERE gameweek=$1 GROUP BY locked_tier ORDER BY MIN(locked_rank)`,[Number(row.gameweek)]);
+    const totals=await pool.query(`SELECT COUNT(*)::int AS manager_count,COUNT(*) FILTER (WHERE picks IS NOT NULL)::int AS picks_count,COUNT(*) FILTER (WHERE picks IS NULL)::int AS missing_picks,COUNT(*) FILTER (WHERE jsonb_typeof(picks)='array' AND jsonb_array_length(picks)=15)::int AS valid_15_picks,COUNT(DISTINCT manager_id)::int AS distinct_managers,MIN(locked_rank)::int AS min_rank,MAX(locked_rank)::int AS max_rank FROM fpl_sample_managers WHERE gameweek=$1`,[Number(row.gameweek)]);
+    console.log(`RECOVERY DIAGNOSTIC: snapshot GW ${row.gameweek} | season=${row.season} | status=${row.status} | deadline=${row.deadline?.toISOString?.() ?? row.deadline} | lock_time=${row.lock_time?.toISOString?.() ?? row.lock_time} | total_managers=${row.total_managers} | locked_at=${row.locked_at?.toISOString?.() ?? row.locked_at} | picks_captured_at=${row.picks_captured_at?.toISOString?.() ?? row.picks_captured_at} | created_at=${row.created_at?.toISOString?.() ?? row.created_at}`);
+    console.log(`RECOVERY DIAGNOSTIC: GW ${row.gameweek} totals = ${JSON.stringify(totals.rows[0]||{})}`);
+    console.log(`RECOVERY DIAGNOSTIC: GW ${row.gameweek} tiers = ${JSON.stringify(counts.rows)}`);
+  }
   if(complete.rowCount){
     console.log("RECOVERY TRACE: stopping because a complete snapshot already exists for this season.");
     return;
