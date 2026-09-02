@@ -149,31 +149,60 @@ export async function recoverMissedSnapshot(){
   console.log(`RECOVERY: FPL bootstrap received (${Array.isArray(bootstrap.events)?bootstrap.events.length:0} events).`);
   const events=Array.isArray(bootstrap.events)?bootstrap.events:[];
   const current=events.find(event=>event.is_current===true);
-  if(!current)return;
+  console.log(`RECOVERY TRACE: current gameweek = ${current?.id ?? "none"}.`);
+  if(!current){
+    console.log("RECOVERY TRACE: stopping because no current gameweek was found.");
+    return;
+  }
 
   const finished=events.filter(event=>event.finished===true&&event.data_checked===true&&event.deadline_time).sort((a,b)=>Number(b.id)-Number(a.id));
   const target=finished[0];
-  if(!target)return;
+  console.log(`RECOVERY TRACE: latest finished gameweek = ${target?.id ?? "none"}; finished count = ${finished.length}.`);
+  if(!target){
+    console.log("RECOVERY TRACE: stopping because no finished, data-checked gameweek was found.");
+    return;
+  }
 
   const season=seasonLabel();
+  console.log(`RECOVERY TRACE: season = ${season}; checking for an existing complete snapshot.`);
   const complete=await pool.query(`SELECT 1 FROM fpl_gameweeks WHERE season=$1 AND status='complete' LIMIT 1`,[season]);
-  if(complete.rowCount)return;
+  console.log(`RECOVERY TRACE: complete snapshot query returned ${complete.rowCount} row(s).`);
+  if(complete.rowCount){
+    console.log("RECOVERY TRACE: stopping because a complete snapshot already exists for this season.");
+    return;
+  }
 
+  console.log(`RECOVERY TRACE: checking current GW ${current.id} state and samples.`);
   const currentState=await pool.query(`SELECT status FROM fpl_gameweeks WHERE gameweek=$1`,[Number(current.id)]);
   const currentSamples=await pool.query(`SELECT 1 FROM fpl_sample_managers WHERE gameweek=$1 LIMIT 1`,[Number(current.id)]);
+  console.log(`RECOVERY TRACE: current state = ${currentState.rowCount ? currentState.rows[0].status : "none"}; current samples = ${currentSamples.rowCount}.`);
   if((currentState.rowCount&&['locking','locked'].includes(currentState.rows[0].status))||currentSamples.rowCount){
     console.log(`GW ${current.id} collection is already in progress; preserving the last published snapshot.`);
     return;
   }
 
+  console.log(`RECOVERY TRACE: checking target GW ${target.id} state.`);
   const targetState=await pool.query(`SELECT status FROM fpl_gameweeks WHERE gameweek=$1`,[Number(target.id)]);
-  if(targetState.rowCount&&['locking','locked','complete'].includes(targetState.rows[0].status))return;
+  console.log(`RECOVERY TRACE: target state = ${targetState.rowCount ? targetState.rows[0].status : "none"}.`);
+  if(targetState.rowCount&&['locking','locked','complete'].includes(targetState.rows[0].status)){
+    console.log(`RECOVERY TRACE: stopping because target GW ${target.id} already has protected status ${targetState.rows[0].status}.`);
+    return;
+  }
 
+  console.log(`RECOVERY TRACE: checking target GW ${target.id} for existing sample rows.`);
   const sampleRows=await pool.query(`SELECT 1 FROM fpl_sample_managers WHERE gameweek=$1 LIMIT 1`,[Number(target.id)]);
-  if(sampleRows.rowCount)return;
+  console.log(`RECOVERY TRACE: target sample rows = ${sampleRows.rowCount}.`);
+  if(sampleRows.rowCount){
+    console.log(`RECOVERY TRACE: stopping because target GW ${target.id} already has sample rows.`);
+    return;
+  }
 
   const deadline=new Date(target.deadline_time);
-  if(!Number.isFinite(deadline.getTime())||deadline.getTime()>Date.now())return;
+  console.log(`RECOVERY TRACE: target deadline = ${target.deadline_time}; parsed = ${deadline.toISOString()}; now = ${new Date().toISOString()}.`);
+  if(!Number.isFinite(deadline.getTime())||deadline.getTime()>Date.now()){
+    console.log("RECOVERY TRACE: stopping because target deadline is invalid or has not passed yet.");
+    return;
+  }
 
   console.log(`GW ${target.id} recovery: no published snapshot and no active current-GW collection; rebuilding the latest finished gameweek.`);
   const recovered=[];
