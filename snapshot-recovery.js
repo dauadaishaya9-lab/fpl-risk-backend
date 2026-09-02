@@ -140,9 +140,13 @@ async function recoverBand({band,season,gameweek,totalManagers}) {
 
 export async function recoverMissedSnapshot(){
   if(!pool)return;
+  console.log("RECOVERY: starting database schema check.");
   await ensureSchema();
+  console.log("RECOVERY: database schema check complete.");
 
+  console.log("RECOVERY: fetching FPL bootstrap.");
   const bootstrap=await fetchJSON(FPL_URL,20000,{label:"FPL bootstrap during snapshot recovery"});
+  console.log(`RECOVERY: FPL bootstrap received (${Array.isArray(bootstrap.events)?bootstrap.events.length:0} events).`);
   const events=Array.isArray(bootstrap.events)?bootstrap.events:[];
   const current=events.find(event=>event.is_current===true);
   if(!current)return;
