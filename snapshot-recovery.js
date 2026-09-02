@@ -38,7 +38,7 @@ async function ensureSchema() {
   if (!pool) return;
   await pool.query(`
     CREATE TABLE IF NOT EXISTS fpl_gameweeks (
-      gameweek INTEGER PRIMARY KEY REFERENCES fpl_gameweeks(gameweek) ON DELETE CASCADE,
+      gameweek INTEGER PRIMARY KEY,
       season TEXT NOT NULL,
       deadline TIMESTAMPTZ NOT NULL,
       lock_time TIMESTAMPTZ NOT NULL,
@@ -165,7 +165,6 @@ async function recoverMissedSnapshot() {
   const complete = await pool.query(`SELECT 1 FROM fpl_gameweeks WHERE season=$1 AND status='complete' LIMIT 1`, [season]);
   if (complete.rowCount) return;
 
-  // If the current GW already has rank collection underway, never fall back or rebuild an older GW.
   const currentState = await pool.query(`SELECT status FROM fpl_gameweeks WHERE gameweek=$1`, [Number(current.id)]);
   const currentSamples = await pool.query(`SELECT 1 FROM fpl_sample_managers WHERE gameweek=$1 LIMIT 1`, [Number(current.id)]);
   if ((currentState.rowCount && ['locking','locked'].includes(currentState.rows[0].status)) || currentSamples.rowCount) {
