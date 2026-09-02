@@ -12,6 +12,7 @@ import { isOwner,
   pool,
   TRIAL_LIMIT
 } from "./risk-engine.js";
+import { recoverMissedSnapshot } from "./snapshot-recovery.js";
 
 const { Pool } = pg;
 const PUBLIC_PORT = Number(process.env.PORT || 3000);
@@ -284,31 +285,29 @@ const gateway = http.createServer(async (req, res) => {
           expectedPoints: Number(body.expectedPoints)
         });
         if (await isRankImpactEntitled(auth.userId, isOwner)) {
-        try {
-          const fpl = await getLinkedFplId(auth.userId);
-
-          if (fpl) {
-            result.rankImpact = await estimateRankImpact({
-              fplId: fpl.fplId,
-              relativeSwing: result.relativeSwing,
-              gameweek: result.gameweek,
-              tierName: result.tier.name
-            });
+          try {
+            const fpl = await getLinkedFplId(auth.userId);
+            if (fpl) {
+              result.rankImpact = await estimateRankImpact({
+                fplId: fpl.fplId,
+                relativeSwing: result.relativeSwing,
+                gameweek: result.gameweek,
+                tierName: result.tier.name
+              });
+            }
+          } catch (error) {
+            console.error("RANK IMPACT ESTIMATION FAILED:", error.message);
+            result.rankImpact = null;
           }
-        } catch (error) {
-          console.error("RANK IMPACT ESTIMATION FAILED:", error.message);
-          result.rankImpact = null;
         }
-      }
-
-      return json(
-        res,
-        200,
-        { ...result, usage: paid || isOwner(auth.userId)
-          ? { used: 0, remaining: null, limit: null, unlimited: true, paid }
-          : { ...await getUsage(auth.userId), paid: false } },
-        responseCors
-      );
+        return json(
+          res,
+          200,
+          { ...result, usage: paid || isOwner(auth.userId)
+            ? { used: 0, remaining: null, limit: null, unlimited: true, paid }
+            : { ...await getUsage(auth.userId), paid: false } },
+          responseCors
+        );
       } catch (error) {
         if (trial?.allowed) await refundTrial(auth.userId, trial.gameweek);
         return json(res, error.status || 400, { error: error.message, code: error.code || "CALCULATOR_ERROR" }, responseCors);
@@ -323,11 +322,8 @@ const gateway = http.createServer(async (req, res) => {
   }
 });
 
-async function init() {
-  const error = configError();
-  if (error) throw new Error(error);
+async function initDatabase() {
   if (!usagePool) throw new Error("DATABASE_URL is required.");
-
   await usagePool.query(`
     CREATE TABLE IF NOT EXISTS fpl_current_account_links (
       user_id TEXT PRIMARY KEY,
@@ -350,14 +346,39 @@ async function init() {
     );
     CREATE INDEX IF NOT EXISTS idx_user_deadline_usage_deadline ON user_deadline_usage(deadline_at);
   `);
-
-  process.env.PORT = String(INTERNAL_PORT);
-  await import("./server.js");
-  backendReady = true;
-  gateway.listen(PUBLIC_PORT, "0.0.0.0", () => console.log(`Season-aware FPL security gateway listening on ${PUBLIC_PORT}; internal backend on ${INTERNAL_PORT}`));
 }
 
-init().catch(error => {
-  console.error("FATAL STARTUP ERROR:", error.message);
-  process.exit(1);
-});
+async function start() {
+  gateway.listen(PUBLIC_PORT, "0.0.0.0", () => {
+    console.log(`Security gateway listening on ${PUBLIC_PORT}; backend is initializing behind it.`);
+  });
+
+  try {
+    await initDatabase();
+    process.env.PORT = String(INTERNAL_PORT);
+    process.env.DEFER_SCHEDULER = "1";
+    const backend = await import("./server.js");
+
+    backendReady = true;
+    console.log(`Security gateway HEALTHY on ${PUBLIC_PORT}; internal backend ready on ${INTERNAL_PORT}.`);
+    console.log("Background FPL snapshot collection is starting after health is established.");
+
+    setImmediate(async () => {
+      try {
+        await recoverMissedSnapshot();
+      } catch (error) {
+        console.error("BACKGROUND SNAPSHOT RECOVERY FAILED:", error.message);
+      }
+      try {
+        backend.startScheduler();
+      } catch (error) {
+        console.error("BACKGROUND SCHEDULER START FAILED:", error.message);
+      }
+    });
+  } catch (error) {
+    console.error("FATAL STARTUP ERROR:", error.message);
+    process.exit(1);
+  }
+}
+
+start();
