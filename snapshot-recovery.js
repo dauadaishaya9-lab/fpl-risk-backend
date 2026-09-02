@@ -134,14 +134,17 @@ async function recoverBand({ band, season, gameweek, totalManagers }) {
   }
 
   const recovered = [];
-  for (const manager of selected) {
+  for (let index = 0; index < selected.length; index++) {
+    const manager = selected[index];
     const managerId = Number(manager.entry);
+    console.log(`GW ${gameweek} recovery ${band.name}: fetching manager ${index + 1}/${selected.length} picks (ID ${managerId}).`);
     const picksData = await fetchJSON(`${ENTRY_URL}${managerId}/event/${gameweek}/picks/`);
     const picks = Array.isArray(picksData.picks) ? picksData.picks : [];
     if (picks.length !== 15) throw new Error(`Manager ${managerId} has ${picks.length} picks for GW ${gameweek}`);
     const captain = picks.find(p => p.is_captain === true);
     const triple = picks.find(p => p.is_captain === true && Number(p.multiplier) === 3);
     recovered.push({ managerId, lockedRank: Number(manager.last_rank), lockedTier: tierForRank(Number(manager.last_rank),totalManagers), managerName: manager.player_name || null, teamName: manager.entry_name || null, overallPointsAtLock: null, picks, activeChip: picksData.active_chip ?? null, captain: captain ? Number(captain.element) : null, tripleCaptain: triple ? Number(triple.element) : null });
+    console.log(`GW ${gameweek} recovery ${band.name}: manager ${index + 1}/${selected.length} picks verified.`);
   }
   return recovered;
 }
