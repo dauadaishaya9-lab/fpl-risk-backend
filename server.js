@@ -56,8 +56,37 @@ async function getManagerPicks(managerId,gameweek){ return fetchJSON(`${ENTRY_UR
 async function initDatabase(){
   if(!pool)throw new Error("DATABASE_URL is not configured.");
   await pool.query(`CREATE TABLE IF NOT EXISTS fpl_gameweeks (gameweek INTEGER PRIMARY KEY, season TEXT NOT NULL, deadline TIMESTAMPTZ NOT NULL, lock_time TIMESTAMPTZ NOT NULL, total_managers INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'pending', locked_at TIMESTAMPTZ, picks_captured_at TIMESTAMPTZ, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()); CREATE TABLE IF NOT EXISTS fpl_sample_managers (gameweek INTEGER NOT NULL REFERENCES fpl_gameweeks(gameweek) ON DELETE CASCADE, manager_id INTEGER NOT NULL, locked_rank INTEGER NOT NULL, locked_tier TEXT NOT NULL, manager_name TEXT, team_name TEXT, overall_points_at_lock INTEGER, picks JSONB, active_chip TEXT, captain INTEGER, triple_captain INTEGER, picks_captured_at TIMESTAMPTZ, pick_attempts INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(gameweek,manager_id)); ALTER TABLE fpl_sample_managers ADD COLUMN IF NOT EXISTS pick_attempts INTEGER NOT NULL DEFAULT 0; CREATE INDEX IF NOT EXISTS idx_sample_managers_gameweek_tier ON fpl_sample_managers(gameweek,locked_tier); CREATE INDEX IF NOT EXISTS idx_gameweeks_status_deadline ON fpl_gameweeks(status,deadline);`);
+  await pool.query(`CREATE TABLE IF NOT EXISTS fpl_season_state (id INTEGER PRIMARY KEY CHECK (id=1), season TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'active', last_gw1_deadline TIMESTAMPTZ, gw38_completed_at TIMESTAMPTZ, updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`);
 }
-async function saveGameweekSchedule(fplData){ const season=getSeasonLabel(); for(const event of fplData.events){ if(!event.deadline_time)continue; const deadline=new Date(event.deadline_time); const lockTime=new Date(deadline.getTime()-LOCK_HOURS_BEFORE_DEADLINE*60*60*1000); await pool.query(`INSERT INTO fpl_gameweeks(gameweek,season,deadline,lock_time,total_managers) VALUES($1,$2,$3,$4,$5) ON CONFLICT(gameweek) DO UPDATE SET season=EXCLUDED.season,deadline=EXCLUDED.deadline,lock_time=EXCLUDED.lock_time,total_managers=EXCLUDED.total_managers`,[event.id,season,deadline,lockTime,Number(fplData.total_players)||0]); } }
+async function saveGameweekSchedule(fplData){
+  const gw1=fplData.events.find(event=>Number(event.id)===1&&event.deadline_time);
+  const state=await pool.query(`SELECT season,status,last_gw1_deadline FROM fpl_season_state WHERE id=1`);
+  let season=getSeasonLabel(gw1?.deadline_time?new Date(gw1.deadline_time):new Date());
+  if(state.rowCount&&state.rows[0].status==='awaiting_new_season'){
+    if(!gw1)return false;
+    const newGw1Deadline=new Date(gw1.deadline_time);
+    const lastGw1Deadline=state.rows[0].last_gw1_deadline?new Date(state.rows[0].last_gw1_deadline):null;
+    if(lastGw1Deadline&&!(newGw1Deadline>lastGw1Deadline))return false;
+    season=getSeasonLabel(newGw1Deadline);
+    await pool.query(`UPDATE fpl_season_state SET season=$1,status='active',last_gw1_deadline=$2,updated_at=NOW() WHERE id=1`,[season,newGw1Deadline]);
+    console.log(`FPL NEW SEASON DETECTED: ${season} (GW1 deadline ${newGw1Deadline.toISOString()})`);
+  } else if(state.rowCount&&state.rows[0].last_gw1_deadline&&gw1){
+    const incomingGw1Deadline=new Date(gw1.deadline_time);
+    if(incomingGw1Deadline>new Date(state.rows[0].last_gw1_deadline)){
+      season=getSeasonLabel(incomingGw1Deadline);
+      await pool.query(`UPDATE fpl_season_state SET season=$1,last_gw1_deadline=$2,updated_at=NOW() WHERE id=1`,[season,incomingGw1Deadline]);
+    } else {
+      season=state.rows[0].season;
+    }
+  } else if(state.rowCount){
+    season=state.rows[0].season;
+  } else {
+    const initialGw1Deadline=gw1?new Date(gw1.deadline_time):null;
+    await pool.query(`INSERT INTO fpl_season_state(id,season,status,last_gw1_deadline) VALUES(1,$1,'active',$2) ON CONFLICT(id) DO NOTHING`,[season,initialGw1Deadline]);
+  }
+  for(const event of fplData.events){ if(!event.deadline_time)continue; const deadline=new Date(event.deadline_time); const lockTime=new Date(deadline.getTime()-LOCK_HOURS_BEFORE_DEADLINE*60*60*1000); await pool.query(`INSERT INTO fpl_gameweeks(gameweek,season,deadline,lock_time,total_managers) VALUES($1,$2,$3,$4,$5) ON CONFLICT(gameweek) DO UPDATE SET season=EXCLUDED.season,deadline=EXCLUDED.deadline,lock_time=EXCLUDED.lock_time,total_managers=EXCLUDED.total_managers`,[event.id,season,deadline,lockTime,Number(fplData.total_players)||0]); }
+  return true;
+}
 function getRankTier(rank,totalManagers){ return getSamplingBands(totalManagers).find(b=>rank>=b.min&&rank<=b.max)?.name||null; }
 
 async function lockGameweekSamples(gameweek,fplData){
@@ -81,6 +110,15 @@ async function captureGameweekPicks(gameweek){
 }
 async function completeGameweekAndRetireOld(gameweek){
   await pool.query(`UPDATE fpl_gameweeks SET status='complete',picks_captured_at=COALESCE(picks_captured_at,NOW()) WHERE gameweek=$1`,[gameweek]);
+  if(Number(gameweek)===38){
+    const seasonRow=await pool.query(`SELECT season,deadline FROM fpl_gameweeks WHERE gameweek=38`);
+    const completedSeason=seasonRow.rows[0]?.season||getSeasonLabel();
+    const gw1Row=await pool.query(`SELECT deadline FROM fpl_gameweeks WHERE gameweek=1`);
+    await pool.query(`DELETE FROM fpl_gameweeks`);
+    await pool.query(`INSERT INTO fpl_season_state(id,season,status,last_gw1_deadline,gw38_completed_at,updated_at) VALUES(1,$1,'awaiting_new_season',$2,NOW(),NOW()) ON CONFLICT(id) DO UPDATE SET season=EXCLUDED.season,status='awaiting_new_season',last_gw1_deadline=EXCLUDED.last_gw1_deadline,gw38_completed_at=NOW(),updated_at=NOW()`,[completedSeason,gw1Row.rows[0]?.deadline||null]);
+    console.log(`GW 38 COMPLETE: cleared all previous fpl_gameweeks and fpl_sample_managers; waiting for the actual next-season GW1 deadline.`);
+    return;
+  }
   await pool.query(`DELETE FROM fpl_sample_managers WHERE gameweek < $1`,[gameweek]);
 }
 
@@ -89,7 +127,7 @@ function buildBandFromRows(band,rows){
   const n=managers.length; const pct=counts=>Object.fromEntries(Object.entries(counts).map(([id,c])=>[id,n?Number((c/n*100).toFixed(1)):0])); return {band:band.name,rankRange:{min:band.min,max:band.max},requestedSampleSize:band.sampleSize,successfulSampleSize:n,managers,ownership,ownershipPercent:pct(ownership),captaincy,captaincyPercent:pct(captaincy),tripleCaptaincy,tripleCaptainPercent:pct(tripleCaptaincy)};
 }
 async function getCompletedRiskData(){ const r=await pool.query(`SELECT gameweek,season,total_managers,created_at FROM fpl_gameweeks WHERE status='complete' ORDER BY gameweek DESC LIMIT 1`); if(!r.rowCount)return null; const gw=r.rows[0]; const bands=getSamplingBands(gw.total_managers); const rows=await pool.query(`SELECT gameweek,manager_id,locked_rank,locked_tier,manager_name,team_name,overall_points_at_lock,picks,active_chip,captain,triple_captain FROM fpl_sample_managers WHERE gameweek=$1 AND picks IS NOT NULL ORDER BY locked_rank ASC`,[gw.gameweek]); return {season:gw.season,gameweek:gw.gameweek,totalManagers:gw.total_managers,bands:bands.map(b=>buildBandFromRows(b,rows.rows.filter(r=>r.locked_rank>=b.min&&r.locked_rank<=b.max))),createdAt:gw.created_at,samplingPolicy:{lockHoursBeforeDeadline:LOCK_HOURS_BEFORE_DEADLINE,rankSource:"overall standings at lock time",picksSource:"manager GW picks after deadline",sampling:"deterministic random rank positions; 60 managers per million-rank band from 1,000,001 onward; final band ends at current FPL total managers"}}; }
-async function refreshScheduler(){ if(runtime.refreshing||!pool)return; runtime.refreshing=true; runtime.lastRefreshAttempt=new Date().toISOString(); try{ const fplData=await getFPLData(); await saveGameweekSchedule(fplData); for(const event of fplData.events){ if(!event.deadline_time)continue; const deadline=new Date(event.deadline_time); const lockTime=new Date(deadline.getTime()-LOCK_HOURS_BEFORE_DEADLINE*60*60*1000); if(Date.now()>=lockTime.getTime()&&Date.now()<deadline.getTime()){try{await lockGameweekSamples(event.id,fplData);}catch(error){console.error(`GW ${event.id} LOCK FAILED:`,error.message);}} } const locked=await pool.query(`SELECT gameweek FROM fpl_gameweeks WHERE status='locked' AND deadline<=NOW() ORDER BY gameweek ASC`); for(const row of locked.rows){try{await captureGameweekPicks(row.gameweek);}catch(error){console.error(`GW ${row.gameweek} PICK CAPTURE FAILED:`,error.message);}} runtime.lastSuccessfulRefresh=new Date().toISOString();runtime.lastError=null; }catch(error){runtime.lastError=error.message;console.error("SCHEDULER FAILED:",error.message);}finally{runtime.refreshing=false;} }
+async function refreshScheduler(){ if(runtime.refreshing||!pool)return; runtime.refreshing=true; runtime.lastRefreshAttempt=new Date().toISOString(); try{ const fplData=await getFPLData(); const scheduleReady=await saveGameweekSchedule(fplData); if(!scheduleReady){runtime.lastSuccessfulRefresh=new Date().toISOString();runtime.lastError=null;return;} for(const event of fplData.events){ if(!event.deadline_time)continue; const deadline=new Date(event.deadline_time); const lockTime=new Date(deadline.getTime()-LOCK_HOURS_BEFORE_DEADLINE*60*60*1000); if(Date.now()>=lockTime.getTime()&&Date.now()<deadline.getTime()){try{await lockGameweekSamples(event.id,fplData);}catch(error){console.error(`GW ${event.id} LOCK FAILED:`,error.message);}} } const locked=await pool.query(`SELECT gameweek FROM fpl_gameweeks WHERE status='locked' AND deadline<=NOW() ORDER BY gameweek ASC`); for(const row of locked.rows){try{await captureGameweekPicks(row.gameweek);}catch(error){console.error(`GW ${row.gameweek} PICK CAPTURE FAILED:`,error.message);}} runtime.lastSuccessfulRefresh=new Date().toISOString();runtime.lastError=null; }catch(error){runtime.lastError=error.message;console.error("SCHEDULER FAILED:",error.message);}finally{runtime.refreshing=false;} }
 const server=http.createServer(async(req,res)=>{ const url=new URL(req.url,`http://${req.headers.host||"localhost"}`); if(req.method!=="GET"){sendJSON(res,405,{error:"Method not allowed"},{Allow:"GET"});return;} if(url.pathname==="/"){let databaseReady=false;try{if(pool){await pool.query("SELECT 1");databaseReady=true;}}catch{} sendJSON(res,200,{status:"ok",databaseConfigured:Boolean(pool),databaseReady,refreshing:runtime.refreshing,lastRefreshAttempt:runtime.lastRefreshAttempt,lastSuccessfulRefresh:runtime.lastSuccessfulRefresh,lastError:runtime.lastError,lockHoursBeforeDeadline:LOCK_HOURS_BEFORE_DEADLINE});return;} if(url.pathname==="/api/sample-tiers"){try{const result=await getCompletedRiskData();if(!result){sendJSON(res,503,{error:"No completed locked sample is ready yet."});return;}sendJSON(res,200,result);}catch(error){sendJSON(res,500,{error:"Could not load risk data.",details:error.message});}return;} if(url.pathname==="/api/cache"){if(!pool){sendJSON(res,503,{error:"PostgreSQL is not configured."});return;}try{const result=await pool.query(`SELECT gameweek,season,status,deadline,lock_time,locked_at,picks_captured_at,total_managers FROM fpl_gameweeks ORDER BY gameweek DESC`);sendJSON(res,200,{lockHoursBeforeDeadline:LOCK_HOURS_BEFORE_DEADLINE,gameweeks:result.rows,scheduler:runtime});}catch(error){sendJSON(res,500,{error:error.message});}return;} if(url.pathname.startsWith("/api/entry/")){const entryId=url.pathname.split("/api/entry/")[1];if(!entryId||!/^[0-9]+$/.test(entryId)){sendJSON(res,400,{error:"Invalid FPL ID"});return;}try{const data=await fetchJSON(`${ENTRY_URL}${entryId}/`);sendJSON(res,200,{id:data.id,playerName:`${data.player_first_name} ${data.player_last_name}`,teamName:data.name,overallRank:data.summary_overall_rank,overallPoints:data.summary_overall_points});}catch(error){sendJSON(res,502,{error:"Could not fetch FPL entry",details:error.message});}return;} if(url.pathname==="/api/fpl"){try{sendJSON(res,200,await getFPLData(),{"Cache-Control":"public, max-age=60"});}catch(error){sendJSON(res,502,{error:error.message});}return;} sendJSON(res,404,{error:"Not found"}); });
 async function start(){
   server.listen(PORT,"127.0.0.1",()=>{console.log(`Internal backend listening on loopback port ${PORT}; scheduler will initialize in background.`);console.log(`Sample lock policy: ${LOCK_HOURS_BEFORE_DEADLINE} hour before deadline.`);console.log(`FPL bootstrap cache TTL: ${FPL_CACHE_TTL/1000}s.`);});
