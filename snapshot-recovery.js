@@ -143,7 +143,7 @@ async function recoverBand({ band, season, gameweek, totalManagers }) {
   return recovered;
 }
 
-async function recoverMissedSnapshot() {
+export async function recoverMissedSnapshot() {
   if (!pool) return;
   await ensureSchema();
 
@@ -162,7 +162,6 @@ async function recoverMissedSnapshot() {
   const complete = await pool.query(`SELECT 1 FROM fpl_gameweeks WHERE season=$1 AND status='complete' LIMIT 1`, [season]);
   if (complete.rowCount) return;
 
-  // If the current GW already has rank collection underway, preserve it and never fall back to an older GW.
   const currentState = await pool.query(`SELECT status FROM fpl_gameweeks WHERE gameweek=$1`, [Number(current.id)]);
   const currentSamples = await pool.query(`SELECT 1 FROM fpl_sample_managers WHERE gameweek=$1 LIMIT 1`, [Number(current.id)]);
   if ((currentState.rowCount && ['locking','locked'].includes(currentState.rows[0].status)) || currentSamples.rowCount) {
@@ -202,10 +201,4 @@ async function recoverMissedSnapshot() {
     await pool.query(`DELETE FROM fpl_gameweeks WHERE gameweek=$1 AND status='complete' AND picks_captured_at IS NOT NULL`, [Number(target.id)]);
     console.error(`GW ${target.id} recovery aborted; no snapshot published:`, error.message);
   }
-}
-
-try {
-  await recoverMissedSnapshot();
-} catch (error) {
-  console.error("SNAPSHOT RECOVERY FAILED SAFELY:", error.message);
 }
