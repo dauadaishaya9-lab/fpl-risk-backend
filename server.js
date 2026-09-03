@@ -377,7 +377,7 @@ async function scheduleNextRun(){
   if(!pool||!schedulerStarted)return;
   clearSchedulerTimer();
   try{
-    const result=await pool.query(`SELECT gameweek,status,lock_time,deadline,picks_captured_at,CASE WHEN status='pending' THEN lock_time WHEN picks_captured_at IS NULL THEN GREATEST(deadline + INTERVAL '1 hour', NOW() + INTERVAL '1 hour') ELSE GREATEST(picks_captured_at + INTERVAL '24 hours', NOW() + INTERVAL '1 hour') END AS run_at FROM fpl_gameweeks WHERE status='pending' OR (status='locked' AND (picks_captured_at IS NULL OR picks_captured_at + INTERVAL '24 hours' <= NOW())) ORDER BY run_at ASC LIMIT 1`);
+    const result=await pool.query(`SELECT gameweek,status,lock_time,deadline,picks_captured_at,CASE WHEN status='pending' THEN lock_time WHEN picks_captured_at IS NULL THEN GREATEST(deadline + INTERVAL '1 hour', NOW() + INTERVAL '1 hour') ELSE GREATEST(picks_captured_at + INTERVAL '24 hours', NOW() + INTERVAL '1 hour') END AS run_at FROM fpl_gameweeks WHERE (status='pending' AND lock_time > NOW()) OR (status='locked' AND (picks_captured_at IS NULL OR picks_captured_at + INTERVAL '24 hours' <= NOW())) ORDER BY run_at ASC LIMIT 1`);
     if(!result.rowCount)return;
     const row=result.rows[0];
     const target=new Date(row.run_at).getTime();
