@@ -305,6 +305,7 @@ async function scheduleNextRun(){
   try{
     const result=await pool.query(`SELECT gameweek,status,lock_time,deadline,picks_captured_at,
 CASE
+  WHEN status='pending' AND deadline <= NOW() THEN NOW() + INTERVAL '15 minutes'
   WHEN status='pending' THEN lock_time
   WHEN picks_captured_at IS NULL THEN deadline
   ELSE GREATEST(
@@ -316,11 +317,24 @@ FROM fpl_gameweeks
 WHERE
   (status='pending' AND deadline > NOW())
   OR
+  (status='pending' AND deadline <= NOW()
+    AND deadline = (
+      SELECT MAX(deadline)
+      FROM fpl_gameweeks
+      WHERE status='pending'
+        AND deadline <= NOW()
+    ))
+  OR
   (status='locked' AND deadline <= NOW() AND picks_captured_at IS NULL)
   OR
   (status='complete' AND picks_captured_at IS NOT NULL
     AND picks_captured_at + INTERVAL '12 hours' <= NOW())
-ORDER BY run_at ASC
+ORDER BY
+  CASE
+    WHEN status='pending' AND deadline <= NOW() THEN 0
+    ELSE 1
+  END,
+  run_at ASC
 LIMIT 1`);
     if(!result.rowCount)return;
     const row=result.rows[0];
@@ -346,12 +360,18 @@ async function refreshScheduler(){
     if(!scheduleReady){
       console.log("SCHEDULER: schedule persistence not ready; continuing existing snapshot processing.");
     }
+    const currentEvent=fplData.events.find(event=>event.deadline_time&&!event.finished)||null;
     for(const event of fplData.events){
       if(!event.deadline_time)continue;
       const deadline=new Date(event.deadline_time);
       const lockTime=new Date(deadline.getTime()-LOCK_HOURS_BEFORE_DEADLINE*60*60*1000);
-      if(Date.now()>=lockTime.getTime()&&Date.now()<deadline.getTime()){
-        try{await lockGameweekSamples(event.id,fplData);}catch(error){console.error(`GW ${event.id} LOCK FAILED:`,error.message);}
+      const isLateCurrentGameweek=currentEvent&&Number(currentEvent.id)===Number(event.id)&&Date.now()>=deadline.getTime();
+      if((Date.now()>=lockTime.getTime()&&Date.now()<deadline.getTime())||isLateCurrentGameweek){
+        try{
+          await lockGameweekSamples(event.id,fplData);
+        }catch(error){
+          console.error(`GW ${event.id} LOCK FAILED:`,error.message);
+        }
       }
     }
     const locked=await pool.query(`SELECT gameweek,deadline,picks_captured_at
