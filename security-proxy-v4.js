@@ -12,7 +12,6 @@ import { isOwner,
   pool,
   TRIAL_LIMIT
 } from "./risk-engine.js";
-import { recoverMissedSnapshot } from "./snapshot-recovery.js";
 
 const { Pool } = pg;
 const PUBLIC_PORT = Number(process.env.PORT || 3000);
@@ -377,14 +376,10 @@ async function start() {
     console.log(`Security gateway HEALTHY on ${PUBLIC_PORT}; internal backend ready on ${INTERNAL_PORT}.`);
     console.log("Background FPL snapshot collection is starting after health is established.");
 
-    setImmediate(async () => {
-      try {
-        await recoverMissedSnapshot();
-      } catch (error) {
-        console.error("BACKGROUND SNAPSHOT RECOVERY FAILED:", error.message);
-      }
+    setImmediate(() => {
       try {
         backendModule.startScheduler();
+        console.log("BACKGROUND SCHEDULER STARTED: server.js owns the snapshot lifecycle.");
       } catch (error) {
         console.error("BACKGROUND SCHEDULER START FAILED:", error.message);
       }
