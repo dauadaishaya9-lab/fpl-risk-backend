@@ -10,7 +10,7 @@ const FPL_URL = "https://fantasy.premierleague.com/api/bootstrap-static/";
 const ENTRY_URL = "https://fantasy.premierleague.com/api/entry/";
 const STANDINGS_URL = "https://fantasy.premierleague.com/api/leagues-classic/314/standings/";
 const LOCK_HOURS_BEFORE_DEADLINE = 1;
-const PICK_CAPTURE_DELAY_MS = 60 * 60 * 1000;
+const PICK_REFRESH_INTERVAL_MS = 12 * 60 * 60 * 1000;
 const PICK_RETRY_DELAY_MS = 60 * 1000;
 const FPL_CACHE_TTL = 2 * 60 * 1000;
 const FIXED_BANDS = [
@@ -93,13 +93,21 @@ async function saveGameweekSchedule(fplData){
 function getRankTier(rank,totalManagers){ return getSamplingBands(totalManagers).find(b=>rank>=b.min&&rank<=b.max)?.name||null; }
 
 async function lockGameweekSamples(gameweek,fplData){
-  const event=getEvent(fplData,gameweek); if(!event||!event.deadline_time)return false; const deadline=new Date(event.deadline_time); const lockTime=new Date(deadline.getTime()-LOCK_HOURS_BEFORE_DEADLINE*60*60*1000); if(Date.now()<lockTime.getTime()||Date.now()>=deadline.getTime())return false;
-  const existingCohort=await pool.query(`SELECT COUNT(*)::int AS manager_count FROM fpl_sample_managers WHERE gameweek=$1`,[gameweek]);
+  const event=getEvent(fplData,gameweek); if(!event||!event.deadline_time)return false; const deadline=new Date(event.deadline_time); const lockTime=new Date(deadline.getTime()-LOCK_HOURS_BEFORE_DEADLINE*60*60*1000); if(Date.now()<lockTime.getTime())return false;
+  const existing=await pool.query(`SELECT status FROM fpl_gameweeks WHERE gameweek=$1`,[gameweek]);
+  if(!existing.rowCount||existing.rows[0].status!=="pending")return false;
+
+  const existingCohort=await pool.query(
+    `SELECT COUNT(*)::int AS manager_count
+     FROM fpl_sample_managers
+     WHERE gameweek=$1`,
+    [gameweek]
+  );
+
   if(Number(existingCohort.rows[0]?.manager_count||0)>0){
-    console.log(`GW ${gameweek}: immutable cohort already exists; server.js will reuse the stored manager IDs and will not resample.`);
+    console.log(`GW ${gameweek}: immutable cohort already exists; reusing stored manager IDs.`);
     return false;
   }
-  const existing=await pool.query(`SELECT status FROM fpl_gameweeks WHERE gameweek=$1`,[gameweek]); if(!existing.rowCount||existing.rows[0].status!=="pending")return false;
   const totalManagers=Number(fplData.total_players); if(!Number.isFinite(totalManagers)||totalManagers<=0)throw new Error("FPL total manager count is unavailable.");
   const bands=getSamplingBands(totalManagers); const season=getSeasonLabel(); await pool.query(`UPDATE fpl_gameweeks SET status='locking',locked_at=NOW() WHERE gameweek=$1`,[gameweek]);
   try {
@@ -121,37 +129,48 @@ async function lockGameweekSamples(gameweek,fplData){
   } catch(error){ await pool.query(`DELETE FROM fpl_sample_managers WHERE gameweek=$1`,[gameweek]); await pool.query(`UPDATE fpl_gameweeks SET status='pending',locked_at=NULL WHERE gameweek=$1`,[gameweek]); throw error; }
 }
 
-async function refreshLockedCohortSnapshot(gameweek){
-  const row=await pool.query(`
-    SELECT status,deadline,season
-    FROM fpl_gameweeks
-    WHERE gameweek=$1
-  `,[gameweek]);
+async function captureGameweekPicks(gameweek){
+  const row=await pool.query(
+    `SELECT status,deadline,picks_captured_at
+     FROM fpl_gameweeks
+     WHERE gameweek=$1`,
+    [gameweek]
+  );
 
-  if(!row.rowCount||row.rows[0].status!=="locked")return false;
+  if(!row.rowCount||!["locked","complete"].includes(row.rows[0].status))return false;
 
-  const deadline=new Date(row.rows[0].deadline).getTime();
-  if(Date.now()<deadline)return false;
+  const currentStatus=row.rows[0].status;
 
-  const cohort=await pool.query(`
-    SELECT manager_id,locked_rank,locked_tier,manager_name,team_name,overall_points_at_lock
-    FROM fpl_sample_managers
-    WHERE gameweek=$1
-    ORDER BY locked_rank ASC
-  `,[gameweek]);
 
-  if(!cohort.rowCount){
-    console.error(`GW ${gameweek}: locked cohort is empty; snapshot refused`);
-    return false;
-  }
+  const isInitialCapture=currentStatus==="locked";
+
+
+  const deadline=new Date(row.rows[0].deadline);
+
+
+  if(Date.now()<deadline.getTime())return false;
+
+  const managers=await pool.query(
+    `SELECT manager_id,locked_rank,locked_tier
+     FROM fpl_sample_managers
+     WHERE gameweek=$1
+     ORDER BY locked_rank ASC`,
+    [gameweek]
+  );
+
+  if(!managers.rowCount)return false;
 
   const refreshed=[];
-  const tierStats=new Map();
+  const successfulByTier=new Map();
+  const totalByTier=new Map();
 
-  for(const manager of cohort.rows){
+  for(const manager of managers.rows){
     const tier=manager.locked_tier;
-    if(!tierStats.has(tier))tierStats.set(tier,{successful:0,total:0});
-    tierStats.get(tier).total++;
+
+    totalByTier.set(
+      tier,
+      (totalByTier.get(tier)||0)+1
+    );
 
     try{
       const data=await getManagerPicks(manager.manager_id,gameweek);
@@ -161,223 +180,148 @@ async function refreshLockedCohortSnapshot(gameweek){
         throw new Error(`Expected 15 picks, received ${picks.length}`);
       }
 
-      const captain=picks.find(p=>p.is_captain===true);
-      const triple=picks.find(p=>p.is_captain===true&&Number(p.multiplier)===3);
+      const captain=picks.find(
+        p=>p.is_captain===true
+      );
+
+      const triple=picks.find(
+        p=>p.is_captain===true&&Number(p.multiplier)===3
+      );
 
       refreshed.push({
-        managerId:Number(manager.manager_id),
+        managerId:manager.manager_id,
         picks,
         activeChip:data.active_chip??null,
         captain:captain?Number(captain.element):null,
         tripleCaptain:triple?Number(triple.element):null
       });
 
-      tierStats.get(tier).successful++;
+      successfulByTier.set(
+        tier,
+        (successfulByTier.get(tier)||0)+1
+      );
+
     }catch(error){
-      console.error(`GW ${gameweek} manager ${manager.manager_id} picks failed:`,error.message);
+      console.error(
+        `GW ${gameweek} manager ${manager.manager_id} picks failed:`,
+        error.message
+      );
     }
   }
 
-  const quality=[...tierStats.values()];
-  const acceptable=quality.length>0&&quality.every(v=>v.successful>=Math.ceil(v.total*0.8));
+  const acceptable=[...totalByTier.entries()].every(
+    ([tier,total])=>{
+      const successful=successfulByTier.get(tier)||0;
+      return successful>=Math.ceil(total*0.8);
+    }
+  );
 
   if(!acceptable){
-    console.error(`GW ${gameweek}: snapshot rejected; cohort retained and previous valid picks preserved`);
+    console.log(
+      `GW ${gameweek}: pick snapshot validation failed; existing valid snapshot preserved.`
+    );
     return false;
   }
 
   const client=await pool.connect();
 
   try{
-    await client.query('BEGIN');
-
-    await client.query(`
-      UPDATE fpl_sample_managers
-      SET picks=NULL,
-          active_chip=NULL,
-          captain=NULL,
-          triple_captain=NULL,
-          picks_captured_at=NULL
-      WHERE gameweek=$1
-    `,[gameweek]);
+    await client.query("BEGIN");
 
     for(const item of refreshed){
-      await client.query(`
-        UPDATE fpl_sample_managers
-        SET picks=$1,
-            active_chip=$2,
-            captain=$3,
-            triple_captain=$4,
-            picks_captured_at=NOW()
-        WHERE gameweek=$5
-          AND manager_id=$6
-      `,[
-        JSON.stringify(item.picks),
-        item.activeChip,
-        item.captain,
-        item.tripleCaptain,
-        gameweek,
-        item.managerId
-      ]);
+      await client.query(
+        `UPDATE fpl_sample_managers
+         SET picks=$1,
+             active_chip=$2,
+             captain=$3,
+             triple_captain=$4,
+             picks_captured_at=NOW(),
+             pick_attempts=0
+         WHERE gameweek=$5
+           AND manager_id=$6`,
+        [
+          JSON.stringify(item.picks),
+          item.activeChip,
+          item.captain,
+          item.tripleCaptain,
+          gameweek,
+          item.managerId
+        ]
+      );
     }
 
-    await client.query(`
-      UPDATE fpl_gameweeks
-      SET picks_captured_at=NOW()
-      WHERE gameweek=$1
-    `,[gameweek]);
+    await client.query(
+      `UPDATE fpl_gameweeks
+       SET picks_captured_at=NOW(),
+           status='complete'
+       WHERE gameweek=$1`,
+      [gameweek]
+    );
 
-    await client.query('COMMIT');
+    await client.query("COMMIT");
+
   }catch(error){
-    await client.query('ROLLBACK');
+    await client.query("ROLLBACK");
     throw error;
+
   }finally{
     client.release();
   }
 
-  const verify=await pool.query(`
-    SELECT
-      COUNT(*)::int AS total,
-      COUNT(DISTINCT manager_id)::int AS distinct_managers,
-      COUNT(*) FILTER (WHERE overall_points_at_lock IS NULL)::int AS missing_locked_points,
-      COUNT(*) FILTER (WHERE picks IS NOT NULL)::int AS picks_ready
-    FROM fpl_sample_managers
-    WHERE gameweek=$1
-  `,[gameweek]);
+  console.log(
+    `GW ${gameweek}: valid pick snapshot ${isInitialCapture?"created":"refreshed"} for ${refreshed.length} managers.`
+  );
 
-  const v=verify.rows[0];
-
-  if(
-    Number(v.total)!==cohort.rowCount ||
-    Number(v.distinct_managers)!==cohort.rowCount ||
-    Number(v.missing_locked_points)!==0 ||
-    Number(v.picks_ready)<Math.ceil(cohort.rowCount*0.8)
-  ){
-    throw new Error(`GW ${gameweek}: snapshot verification failed`);
-  }
-
-  const cleanupClient=await pool.connect();
-
-  try{
-    await cleanupClient.query('BEGIN');
-
-    if(Number(gameweek)===38){
-      const seasonRow=await cleanupClient.query(`
-        SELECT season,deadline
-        FROM fpl_gameweeks
-        WHERE gameweek=38
-      `);
-
-      const completedSeason=seasonRow.rows[0]?.season||getSeasonLabel();
-
-      const gw1Row=await cleanupClient.query(`
-        SELECT deadline
-        FROM fpl_gameweeks
-        WHERE gameweek=1
-      `);
-
-      await cleanupClient.query(`DELETE FROM fpl_gameweeks`);
-
-      await cleanupClient.query(`
-        INSERT INTO fpl_season_state
-          (id,season,status,last_gw1_deadline,gw38_completed_at,updated_at)
-        VALUES
-          (1,$1,'awaiting_new_season',$2,NOW(),NOW())
-        ON CONFLICT(id) DO UPDATE SET
-          season=EXCLUDED.season,
-          status='awaiting_new_season',
-          last_gw1_deadline=EXCLUDED.last_gw1_deadline,
-          gw38_completed_at=NOW(),
-          updated_at=NOW()
-      `,[
-        completedSeason,
-        gw1Row.rows[0]?.deadline||null
-      ]);
-
-      await cleanupClient.query('COMMIT');
-
-      console.log(`GW 38 SNAPSHOT VERIFIED: season completed; waiting for the actual next-season GW1 deadline.`);
-      return true;
+  if(isInitialCapture){
+      await completeGameweekAndRetireOld(gameweek);
     }
-
-    await cleanupClient.query(`
-      DELETE FROM fpl_sample_managers
-      WHERE gameweek < $1
-    `,[gameweek]);
-
-    await cleanupClient.query('COMMIT');
-
-    console.log(`GW ${gameweek} SNAPSHOT VERIFIED: locked cohort retained; previous cohorts retired.`);
     return true;
-  }catch(error){
-    await cleanupClient.query('ROLLBACK');
-    console.error(`GW ${gameweek}: cohort retirement deferred; current valid cohort remains usable`);
-    throw error;
-  }finally{
-    cleanupClient.release();
-  }
 }
 
-async function captureGameweekPicks(gameweek){
-  return refreshLockedCohortSnapshot(gameweek);
+async function completeGameweekAndRetireOld(gameweek){
+  await pool.query(`UPDATE fpl_gameweeks SET status='complete',picks_captured_at=COALESCE(picks_captured_at,NOW()) WHERE gameweek=$1`,[gameweek]);
+  if(Number(gameweek)===38){
+    const seasonRow=await pool.query(`SELECT season,deadline FROM fpl_gameweeks WHERE gameweek=38`);
+    const completedSeason=seasonRow.rows[0]?.season||getSeasonLabel();
+    const gw1Row=await pool.query(`SELECT deadline FROM fpl_gameweeks WHERE gameweek=1`);
+    await pool.query(`DELETE FROM fpl_gameweeks`);
+    await pool.query(`INSERT INTO fpl_season_state(id,season,status,last_gw1_deadline,gw38_completed_at,updated_at) VALUES(1,$1,'awaiting_new_season',$2,NOW(),NOW()) ON CONFLICT(id) DO UPDATE SET season=EXCLUDED.season,status='awaiting_new_season',last_gw1_deadline=EXCLUDED.last_gw1_deadline,gw38_completed_at=NOW(),updated_at=NOW()`,[completedSeason,gw1Row.rows[0]?.deadline||null]);
+    console.log(`GW 38 COMPLETE: cleared all previous fpl_gameweeks and fpl_sample_managers; waiting for the actual next-season GW1 deadline.`);
+    return;
+  }
+  await pool.query(`DELETE FROM fpl_sample_managers WHERE gameweek < $1`,[gameweek]);
 }
 
 function buildBandFromRows(band,rows){
   const ownership={},captaincy={},tripleCaptaincy={},managers=[]; for(const row of rows){ if(!Array.isArray(row.picks))continue; const picks=row.picks; const captain=picks.find(p=>p.is_captain===true); const triple=picks.find(p=>p.is_captain===true&&Number(p.multiplier)===3); for(const pick of picks){const id=String(pick.element); ownership[id]=(ownership[id]||0)+1;} if(captain){const id=String(captain.element);captaincy[id]=(captaincy[id]||0)+1;} if(triple){const id=String(triple.element);tripleCaptaincy[id]=(tripleCaptaincy[id]||0)+1;} managers.push({rank:row.locked_rank,managerId:row.manager_id,managerName:row.manager_name,teamName:row.team_name,overallPoints:row.overall_points_at_lock,lockedTier:band.name,activeChip:row.active_chip,captain:row.captain,tripleCaptain:row.triple_captain,picks}); }
   const n=managers.length; const pct=counts=>Object.fromEntries(Object.entries(counts).map(([id,c])=>[id,n?Number((c/n*100).toFixed(1)):0])); return {band:band.name,rankRange:{min:band.min,max:band.max},requestedSampleSize:band.sampleSize,successfulSampleSize:n,managers,ownership,ownershipPercent:pct(ownership),captaincy,captaincyPercent:pct(captaincy),tripleCaptaincy,tripleCaptainPercent:pct(tripleCaptaincy)};
 }
-async function getCompletedRiskData(){
-  const r=await pool.query(`
-    SELECT gameweek,season,total_managers,created_at,status,picks_captured_at
-    FROM fpl_gameweeks
-    WHERE status IN ('locked','complete')
-      AND picks_captured_at IS NOT NULL
-    ORDER BY gameweek DESC
-    LIMIT 1
-  `);
-  if(!r.rowCount)return null;
-
-  const gw=r.rows[0];
-  const bands=getSamplingBands(gw.total_managers);
-
-  const rows=await pool.query(`
-    SELECT gameweek,manager_id,locked_rank,locked_tier,manager_name,team_name,
-           overall_points_at_lock,picks,active_chip,captain,triple_captain
-    FROM fpl_sample_managers
-    WHERE gameweek=$1
-      AND picks IS NOT NULL
-    ORDER BY locked_rank ASC
-  `,[gw.gameweek]);
-
-  const completedBands=bands
-    .map(b=>({
-      band:b,
-      rows:rows.rows.filter(r=>r.locked_rank>=b.min&&r.locked_rank<=b.max)
-    }))
-    .filter(x=>x.rows.length>0);
-
-  return {
-    season:gw.season,
-    gameweek:gw.gameweek,
-    totalManagers:gw.total_managers,
-    bands:completedBands.map(x=>buildBandFromRows(x.band,x.rows)),
-    createdAt:gw.created_at,
-    picksCapturedAt:gw.picks_captured_at,
-    samplingPolicy:{
-      lockHoursBeforeDeadline:LOCK_HOURS_BEFORE_DEADLINE,
-      rankSource:"overall standings at lock time",
-      picksSource:"manager GW picks after deadline",
-      sampling:"deterministic random rank positions; 60 managers per million-rank band from 1,000,001 onward; collection stops at the last tier with a complete requested manager sample"
-    }
-  };
-}
+async function getCompletedRiskData(){ const r=await pool.query(`SELECT gameweek,season,total_managers,created_at FROM fpl_gameweeks WHERE status='complete' ORDER BY gameweek DESC LIMIT 1`); if(!r.rowCount)return null; const gw=r.rows[0]; const bands=getSamplingBands(gw.total_managers); const rows=await pool.query(`SELECT gameweek,manager_id,locked_rank,locked_tier,manager_name,team_name,overall_points_at_lock,picks,active_chip,captain,triple_captain FROM fpl_sample_managers WHERE gameweek=$1 AND picks IS NOT NULL ORDER BY locked_rank ASC`,[gw.gameweek]); const completedBands=bands.map(b=>({band:b,rows:rows.rows.filter(r=>r.locked_rank>=b.min&&r.locked_rank<=b.max)})).filter(x=>x.rows.length>0); return {season:gw.season,gameweek:gw.gameweek,totalManagers:gw.total_managers,bands:completedBands.map(x=>buildBandFromRows(x.band,x.rows)),createdAt:gw.created_at,samplingPolicy:{lockHoursBeforeDeadline:LOCK_HOURS_BEFORE_DEADLINE,rankSource:"overall standings at lock time",picksSource:"manager GW picks; latest valid snapshot refreshed every 12 hours",sampling:"deterministic random rank positions; 60 managers per million-rank band from 1,000,001 onward; collection stops at the last tier with a complete requested manager sample"}}; }
 
 function clearSchedulerTimer(){ if(schedulerTimer){clearTimeout(schedulerTimer);schedulerTimer=null;} runtime.nextScheduledRun=null; }
 async function scheduleNextRun(){
   if(!pool||!schedulerStarted)return;
   clearSchedulerTimer();
   try{
-    const result=await pool.query(`SELECT gameweek,status,lock_time,deadline,picks_captured_at,CASE WHEN status='pending' THEN lock_time WHEN picks_captured_at IS NULL THEN GREATEST(deadline + INTERVAL '1 hour', NOW() + INTERVAL '1 hour') ELSE GREATEST(picks_captured_at + INTERVAL '24 hours', NOW() + INTERVAL '1 hour') END AS run_at FROM fpl_gameweeks WHERE (status='pending' AND lock_time > NOW()) OR (status='locked' AND (picks_captured_at IS NULL OR picks_captured_at + INTERVAL '24 hours' <= NOW())) ORDER BY run_at ASC LIMIT 1`);
+    const result=await pool.query(`SELECT gameweek,status,lock_time,deadline,picks_captured_at,
+CASE
+  WHEN status='pending' THEN lock_time
+  WHEN picks_captured_at IS NULL THEN deadline
+  ELSE GREATEST(
+    picks_captured_at + INTERVAL '12 hours',
+    NOW() + INTERVAL '15 minutes'
+  )
+  END AS run_at
+FROM fpl_gameweeks
+WHERE
+  (status='pending' AND deadline > NOW())
+  OR
+  (status='locked' AND deadline <= NOW() AND picks_captured_at IS NULL)
+  OR
+  (status='complete' AND picks_captured_at IS NOT NULL
+    AND picks_captured_at + INTERVAL '12 hours' <= NOW())
+ORDER BY run_at ASC
+LIMIT 1`);
     if(!result.rowCount)return;
     const row=result.rows[0];
     const target=new Date(row.run_at).getTime();
@@ -399,7 +343,9 @@ async function refreshScheduler(){
   try{
     const fplData=await getFPLData();
     const scheduleReady=await saveGameweekSchedule(fplData);
-    if(!scheduleReady){runtime.lastSuccessfulRefresh=new Date().toISOString();runtime.lastError=null;return;}
+    if(!scheduleReady){
+      console.log("SCHEDULER: schedule persistence not ready; continuing existing snapshot processing.");
+    }
     for(const event of fplData.events){
       if(!event.deadline_time)continue;
       const deadline=new Date(event.deadline_time);
@@ -408,7 +354,16 @@ async function refreshScheduler(){
         try{await lockGameweekSamples(event.id,fplData);}catch(error){console.error(`GW ${event.id} LOCK FAILED:`,error.message);}
       }
     }
-    const locked=await pool.query(`SELECT gameweek,deadline,picks_captured_at FROM fpl_gameweeks WHERE status='locked' AND deadline + INTERVAL '1 hour' <= NOW() AND (picks_captured_at IS NULL OR picks_captured_at + INTERVAL '24 hours' <= NOW()) ORDER BY COALESCE(picks_captured_at,deadline) ASC`);
+    const locked=await pool.query(`SELECT gameweek,deadline,picks_captured_at
+FROM fpl_gameweeks
+WHERE deadline <= NOW()
+  AND (
+    (status='locked' AND picks_captured_at IS NULL)
+    OR
+    (status='complete' AND picks_captured_at IS NOT NULL
+      AND picks_captured_at + INTERVAL '12 hours' <= NOW())
+  )
+ORDER BY COALESCE(picks_captured_at,deadline) ASC`);
     for(const row of locked.rows){
       try{await captureGameweekPicks(row.gameweek);}catch(error){console.error(`GW ${row.gameweek} PICK CAPTURE FAILED:`,error.message);}
     }
@@ -423,7 +378,7 @@ async function refreshScheduler(){
   }
 }
 export function startScheduler(){ if(schedulerStarted||!pool)return; schedulerStarted=true; refreshScheduler().catch(error=>console.error("BACKGROUND SCHEDULER FAILED:",error.message)); }
-const server=http.createServer(async(req,res)=>{ const url=new URL(req.url,`http://${req.headers.host||"localhost"}`); if(req.method!=="GET"){sendJSON(res,405,{error:"Method not allowed"},{Allow:"GET"});return;} if(url.pathname==="/"){let databaseReady=false;try{if(pool){await pool.query("SELECT 1");databaseReady=true;}}catch{} sendJSON(res,200,{status:"ok",databaseConfigured:Boolean(pool),databaseReady,refreshing:runtime.refreshing,lastRefreshAttempt:runtime.lastRefreshAttempt,lastSuccessfulRefresh:runtime.lastSuccessfulRefresh,lastError:runtime.lastError,nextScheduledRun:runtime.nextScheduledRun,lockHoursBeforeDeadline:LOCK_HOURS_BEFORE_DEADLINE,pickCaptureDelayMinutes:PICK_CAPTURE_DELAY_MS/60000});return;} if(url.pathname==="/api/sample-tiers"){try{const result=await getCompletedRiskData();if(!result){sendJSON(res,503,{error:"No completed locked sample is ready yet."});return;}sendJSON(res,200,result);}catch(error){sendJSON(res,500,{error:"Could not load risk data.",details:error.message});}return;} if(url.pathname==="/api/cache"){if(!pool){sendJSON(res,503,{error:"PostgreSQL is not configured."});return;}try{const result=await pool.query(`SELECT gameweek,season,status,deadline,lock_time,locked_at,picks_captured_at,total_managers FROM fpl_gameweeks ORDER BY gameweek DESC`);sendJSON(res,200,{lockHoursBeforeDeadline:LOCK_HOURS_BEFORE_DEADLINE,pickCaptureDelayMinutes:PICK_CAPTURE_DELAY_MS/60000,gameweeks:result.rows,scheduler:runtime});}catch(error){sendJSON(res,500,{error:error.message});}return;} if(url.pathname.startsWith("/api/entry/")){const entryId=url.pathname.split("/api/entry/")[1];if(!entryId||!/^[0-9]+$/.test(entryId)){sendJSON(res,400,{error:"Invalid FPL ID"});return;}try{const data=await fetchJSON(`${ENTRY_URL}${entryId}/`,20000,{label:`entry ${entryId}`});sendJSON(res,200,{id:data.id,playerName:`${data.player_first_name} ${data.player_last_name}`,teamName:data.name,overallRank:data.summary_overall_rank,overallPoints:data.summary_overall_points});}catch(error){sendJSON(res,502,{error:"Could not fetch FPL entry",details:error.message});}return;} if(url.pathname==="/api/fpl"){try{sendJSON(res,200,await getFPLData(),{"Cache-Control":"public, max-age=60"});}catch(error){sendJSON(res,502,{error:error.message});}return;} sendJSON(res,404,{error:"Not found"}); });
+const server=http.createServer(async(req,res)=>{ const url=new URL(req.url,`http://${req.headers.host||"localhost"}`); if(req.method!=="GET"){sendJSON(res,405,{error:"Method not allowed"},{Allow:"GET"});return;} if(url.pathname==="/"){let databaseReady=false;try{if(pool){await pool.query("SELECT 1");databaseReady=true;}}catch{} sendJSON(res,200,{status:"ok",databaseConfigured:Boolean(pool),databaseReady,refreshing:runtime.refreshing,lastRefreshAttempt:runtime.lastRefreshAttempt,lastSuccessfulRefresh:runtime.lastSuccessfulRefresh,lastError:runtime.lastError,nextScheduledRun:runtime.nextScheduledRun,lockHoursBeforeDeadline:LOCK_HOURS_BEFORE_DEADLINE,pickRefreshIntervalHours:PICK_REFRESH_INTERVAL_MS/3600000});return;} if(url.pathname==="/api/sample-tiers"){try{const result=await getCompletedRiskData();if(!result){sendJSON(res,503,{error:"No completed locked sample is ready yet."});return;}sendJSON(res,200,result);}catch(error){sendJSON(res,500,{error:"Could not load risk data.",details:error.message});}return;} if(url.pathname==="/api/cache"){if(!pool){sendJSON(res,503,{error:"PostgreSQL is not configured."});return;}try{const result=await pool.query(`SELECT gameweek,season,status,deadline,lock_time,locked_at,picks_captured_at,total_managers FROM fpl_gameweeks ORDER BY gameweek DESC`);sendJSON(res,200,{lockHoursBeforeDeadline:LOCK_HOURS_BEFORE_DEADLINE,pickRefreshIntervalHours:PICK_REFRESH_INTERVAL_MS/3600000,gameweeks:result.rows,scheduler:runtime});}catch(error){sendJSON(res,500,{error:error.message});}return;} if(url.pathname.startsWith("/api/entry/")){const entryId=url.pathname.split("/api/entry/")[1];if(!entryId||!/^[0-9]+$/.test(entryId)){sendJSON(res,400,{error:"Invalid FPL ID"});return;}try{const data=await fetchJSON(`${ENTRY_URL}${entryId}/`,20000,{label:`entry ${entryId}`});sendJSON(res,200,{id:data.id,playerName:`${data.player_first_name} ${data.player_last_name}`,teamName:data.name,overallRank:data.summary_overall_rank,overallPoints:data.summary_overall_points});}catch(error){sendJSON(res,502,{error:"Could not fetch FPL entry",details:error.message});}return;} if(url.pathname==="/api/fpl"){try{sendJSON(res,200,await getFPLData(),{"Cache-Control":"public, max-age=60"});}catch(error){sendJSON(res,502,{error:error.message});}return;} sendJSON(res,404,{error:"Not found"}); });
 async function start(){
   server.listen(PORT,"127.0.0.1",()=>{console.log(`Internal backend listening on loopback port ${PORT}; scheduler will initialize in background.`);console.log(`Sample lock policy: ${LOCK_HOURS_BEFORE_DEADLINE} hour before deadline.`);console.log(`FPL bootstrap cache TTL: ${FPL_CACHE_TTL/1000}s.`);});
   if(pool){try{await initDatabase();console.log("PostgreSQL connected and schema ready.");if(process.env.DEFER_SCHEDULER!=="1")startScheduler();}catch(error){runtime.lastError=error.message;console.error("DATABASE STARTUP FAILED:",error.message);}}else console.error("DATABASE_URL is missing. PostgreSQL persistence is disabled.");
