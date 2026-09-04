@@ -299,6 +299,33 @@ function buildBandFromRows(band,rows){
 async function getCompletedRiskData(){ const r=await pool.query(`SELECT gameweek,season,total_managers,created_at FROM fpl_gameweeks WHERE status='complete' ORDER BY gameweek DESC LIMIT 1`); if(!r.rowCount)return null; const gw=r.rows[0]; const bands=getSamplingBands(gw.total_managers); const rows=await pool.query(`SELECT gameweek,manager_id,locked_rank,locked_tier,manager_name,team_name,overall_points_at_lock,picks,active_chip,captain,triple_captain FROM fpl_sample_managers WHERE gameweek=$1 AND picks IS NOT NULL ORDER BY locked_rank ASC`,[gw.gameweek]); const completedBands=bands.map(b=>({band:b,rows:rows.rows.filter(r=>r.locked_rank>=b.min&&r.locked_rank<=b.max)})).filter(x=>x.rows.length>0); return {season:gw.season,gameweek:gw.gameweek,totalManagers:gw.total_managers,bands:completedBands.map(x=>buildBandFromRows(x.band,x.rows)),createdAt:gw.created_at,samplingPolicy:{lockHoursBeforeDeadline:LOCK_HOURS_BEFORE_DEADLINE,rankSource:"overall standings at lock time",picksSource:"manager GW picks; latest valid snapshot refreshed every 12 hours",sampling:"deterministic random rank positions; 60 managers per million-rank band from 1,000,001 onward; collection stops at the last tier with a complete requested manager sample"}}; }
 
 function clearSchedulerTimer(){ if(schedulerTimer){clearTimeout(schedulerTimer);schedulerTimer=null;} runtime.nextScheduledRun=null; }
+
+export function getSchedulerHealth(){
+  const now=Date.now();
+  const next=runtime.nextScheduledRun ? new Date(runtime.nextScheduledRun).getTime() : null;
+  const lastAttempt=runtime.lastRefreshAttempt ? new Date(runtime.lastRefreshAttempt).getTime() : null;
+  const lastSuccess=runtime.lastSuccessfulRefresh ? new Date(runtime.lastSuccessfulRefresh).getTime() : null;
+
+  if(!schedulerStarted){
+    return {healthy:false,reason:"scheduler_not_started",refreshing:runtime.refreshing,nextScheduledRun:runtime.nextScheduledRun,lastRefreshAttempt:runtime.lastRefreshAttempt,lastSuccessfulRefresh:runtime.lastSuccessfulRefresh,lastError:runtime.lastError};
+  }
+
+  if(runtime.refreshing){
+    const refreshAge=lastAttempt===null ? Infinity : now-lastAttempt;
+    const healthy=refreshAge <= 30*60*1000;
+    return {healthy,reason:healthy?"refresh_in_progress":"refresh_stuck",refreshing:true,nextScheduledRun:runtime.nextScheduledRun,lastRefreshAttempt:runtime.lastRefreshAttempt,lastSuccessfulRefresh:runtime.lastSuccessfulRefresh,lastError:runtime.lastError};
+  }
+
+  if(next!==null){
+    const overdue=now-next;
+    const healthy=overdue <= 15*60*1000;
+    return {healthy,reason:healthy?"scheduled":"schedule_overdue",refreshing:false,nextScheduledRun:runtime.nextScheduledRun,lastRefreshAttempt:runtime.lastRefreshAttempt,lastSuccessfulRefresh:runtime.lastSuccessfulRefresh,lastError:runtime.lastError};
+  }
+
+  const successAge=lastSuccess===null ? Infinity : now-lastSuccess;
+  const healthy=successAge <= 30*60*1000;
+  return {healthy,reason:healthy?"recently_completed":"no_active_schedule",refreshing:false,nextScheduledRun:null,lastRefreshAttempt:runtime.lastRefreshAttempt,lastSuccessfulRefresh:runtime.lastSuccessfulRefresh,lastError:runtime.lastError};
+}
 async function scheduleNextRun(){
   if(!pool||!schedulerStarted)return;
   clearSchedulerTimer();

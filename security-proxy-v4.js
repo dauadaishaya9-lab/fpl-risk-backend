@@ -35,6 +35,7 @@ const JWKS_TIMEOUT_MS = 5_000;
 const ipBuckets = new Map();
 const userBuckets = new Map();
 let backendReady = false;
+let backendModule = null;
 let jwksCache = { expiresAt: 0, keys: new Map() };
 let jwksRefreshPromise = null;
 const usagePool = DATABASE_URL
@@ -217,7 +218,20 @@ const gateway = http.createServer(async (req, res) => {
     const responseCors = cors(origin);
     if (req.method === "OPTIONS") { res.writeHead(204, cors(origin)); return res.end(); }
     if (limited(ipBuckets, clientIp(req), IP_LIMIT)) return json(res, 429, { error: "Too many requests." }, { ...responseCors, "Retry-After": "60" });
-    if (url.pathname === "/health" || url.pathname === "/") return json(res, backendReady && !configError() ? 200 : 503, { status: backendReady && !configError() ? "ok" : "starting", securityGateway: true, backendReady, authentication: !configError(), fplIdentityStorage: "current-season-only" }, responseCors);
+    if (url.pathname === "/health" || url.pathname === "/") {
+      const schedulerHealth = typeof backendModule?.getSchedulerHealth === "function"
+        ? backendModule.getSchedulerHealth()
+        : { healthy: false, reason: "scheduler_health_unavailable" };
+      const healthy = backendReady && !configError() && schedulerHealth.healthy;
+      return json(res, healthy ? 200 : 503, {
+        status: healthy ? "ok" : "starting",
+        securityGateway: true,
+        backendReady,
+        authentication: !configError(),
+        fplIdentityStorage: "current-season-only",
+        scheduler: schedulerHealth
+      }, responseCors);
+    }
     if (!url.pathname.startsWith("/api/")) return json(res, 404, { error: "Not found" }, responseCors);
     if (!backendReady) return json(res, 503, { error: "Backend is starting." }, { ...responseCors, "Retry-After": "3" });
 
@@ -357,7 +371,7 @@ async function start() {
     await initDatabase();
     process.env.PORT = String(INTERNAL_PORT);
     process.env.DEFER_SCHEDULER = "1";
-    const backend = await import("./server.js");
+    backendModule = await import("./server.js");
 
     backendReady = true;
     console.log(`Security gateway HEALTHY on ${PUBLIC_PORT}; internal backend ready on ${INTERNAL_PORT}.`);
@@ -370,7 +384,7 @@ async function start() {
         console.error("BACKGROUND SNAPSHOT RECOVERY FAILED:", error.message);
       }
       try {
-        backend.startScheduler();
+        backendModule.startScheduler();
       } catch (error) {
         console.error("BACKGROUND SCHEDULER START FAILED:", error.message);
       }
