@@ -385,7 +385,7 @@ async function refreshScheduler(){
     if(!scheduleReady){
       console.log("SCHEDULER: schedule persistence not ready; continuing existing snapshot processing.");
     }
-    currentEvent=fplData.events.find(event=>event.deadline_time&&!event.finished)||null;
+    currentEvent=fplData.events.find(event=>event.is_current===true)||fplData.events.find(event=>event.deadline_time&&!event.finished)||null;
     for(const event of fplData.events){
       if(!event.deadline_time)continue;
       const deadline=new Date(event.deadline_time);
