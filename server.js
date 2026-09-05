@@ -45,7 +45,21 @@ function getSamplingBands(totalManagers) {
 function sendJSON(res,status,data,extraHeaders={}) { res.writeHead(status,{"Content-Type":"application/json; charset=utf-8","Cache-Control":"no-store",...extraHeaders}); res.end(JSON.stringify(data)); }
 async function getFPLData() { const now=Date.now(); if(fplCache.data&&now<fplCache.expiresAt)return fplCache.data; const data=await fetchJSON(FPL_URL,20000,{label:"bootstrap-static"}); fplCache={data,expiresAt:now+FPL_CACHE_TTL}; return data; }
 function getEvent(data,gameweek){ return data.events.find(event=>event.id===gameweek)||null; }
-async function getStandingsPage(page){ return fetchJSON(`${STANDINGS_URL}?page_standings=${page}`,20000,{label:`standings page ${page}`}); }
+async function getStandingsPage(page){
+  const maxAttempts=3;
+  const retryDelayMs=2000;
+  let lastError=null;
+  for(let attempt=1;attempt<=maxAttempts;attempt++){
+    try{
+      return await fetchJSON(`${STANDINGS_URL}?page_standings=${page}`,20000,{label:`standings page ${page}`});
+    }catch(error){
+      lastError=error;
+      console.error(`Failed standings page ${page} attempt ${attempt}/${maxAttempts}:`,error.message);
+      if(attempt<maxAttempts)await new Promise(resolve=>setTimeout(resolve,retryDelayMs));
+    }
+  }
+  throw lastError;
+}
 
 async function getSampleManagersForBand(band,totalManagers,season,gameweek) {
   const maxRank=band.max===Infinity?totalManagers:Math.min(band.max,totalManagers); if(maxRank<band.min)return [];
@@ -93,8 +107,18 @@ async function saveGameweekSchedule(fplData){
 function getRankTier(rank,totalManagers){ return getSamplingBands(totalManagers).find(b=>rank>=b.min&&rank<=b.max)?.name||null; }
 
 async function lockGameweekSamples(gameweek,fplData){
-  const event=getEvent(fplData,gameweek); if(!event||!event.deadline_time)return false; const deadline=new Date(event.deadline_time); const lockTime=new Date(deadline.getTime()-LOCK_HOURS_BEFORE_DEADLINE*60*60*1000); if(Date.now()<lockTime.getTime())return false;
-  const existing=await pool.query(`SELECT status FROM fpl_gameweeks WHERE gameweek=$1`,[gameweek]);
+  const event=getEvent(fplData,gameweek);
+  if(!event||!event.deadline_time)return false;
+
+  const deadline=new Date(event.deadline_time);
+  const lockTime=new Date(deadline.getTime()-LOCK_HOURS_BEFORE_DEADLINE*60*60*1000);
+  if(Date.now()<lockTime.getTime())return false;
+
+  const existing=await pool.query(
+    `SELECT status FROM fpl_gameweeks WHERE gameweek=$1`,
+    [gameweek]
+  );
+
   if(!existing.rowCount||existing.rows[0].status!=="pending")return false;
 
   const existingCohort=await pool.query(
@@ -108,27 +132,116 @@ async function lockGameweekSamples(gameweek,fplData){
     console.log(`GW ${gameweek}: immutable cohort already exists; reusing stored manager IDs.`);
     return false;
   }
-  const totalManagers=Number(fplData.total_players); if(!Number.isFinite(totalManagers)||totalManagers<=0)throw new Error("FPL total manager count is unavailable.");
-  const bands=getSamplingBands(totalManagers); const season=getSeasonLabel(); await pool.query(`UPDATE fpl_gameweeks SET status='locking',locked_at=NOW() WHERE gameweek=$1`,[gameweek]);
-  try {
-    let completedBands=0;
-    for(const band of bands){
-      const managers=await getSampleManagersForBand(band,totalManagers,season,gameweek);
-      if(managers.length<band.sampleSize){
-        console.log(`GW ${gameweek} band ${band.name}: insufficient managers ${managers.length}/${band.sampleSize}; ignoring this tier and all later tiers.`);
-        break;
-      }
-      for(const manager of managers){ const lockedRank=Number(manager.rank); const lockedTier=getRankTier(lockedRank,totalManagers); if(!lockedTier)continue; await pool.query(`INSERT INTO fpl_sample_managers(gameweek,manager_id,locked_rank,locked_tier,manager_name,team_name,overall_points_at_lock) VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(gameweek,manager_id) DO NOTHING`,[gameweek,Number(manager.entry),lockedRank,lockedTier,manager.player_name||null,manager.entry_name||null,Number(manager.total)||0]); }
-      completedBands++;
-      console.log(`GW ${gameweek} band ${band.name}: locked ${managers.length}/${band.sampleSize} managers`);
-    }
-    if(completedBands===0)throw new Error("No rank tier had enough managers to start the snapshot.");
-    await pool.query(`UPDATE fpl_gameweeks SET status='locked' WHERE gameweek=$1`,[gameweek]);
-    console.log(`GW ${gameweek} SAMPLE LOCK COMPLETE THROUGH TIER ${completedBands}/${bands.length}`);
-    return true;
-  } catch(error){ await pool.query(`DELETE FROM fpl_sample_managers WHERE gameweek=$1`,[gameweek]); await pool.query(`UPDATE fpl_gameweeks SET status='pending',locked_at=NULL WHERE gameweek=$1`,[gameweek]); throw error; }
-}
 
+  const totalManagers=Number(fplData.total_players);
+  if(!Number.isFinite(totalManagers)||totalManagers<=0){
+    throw new Error("FPL total manager count is unavailable.");
+  }
+
+  const bands=getSamplingBands(totalManagers);
+  const season=getSeasonLabel();
+  const sampledManagers=[];
+  let completedBands=0;
+
+  for(const band of bands){
+    const managers=await getSampleManagersForBand(
+      band,
+      totalManagers,
+      season,
+      gameweek
+    );
+
+    if(managers.length<band.sampleSize){
+      console.log(
+        `GW ${gameweek} band ${band.name}: insufficient managers ${managers.length}/${band.sampleSize}; lock attempt aborted and scheduler will retry later.`
+      );
+      return false;
+    }
+
+    sampledManagers.push(...managers.map(manager=>({
+      manager,
+      lockedRank:Number(manager.rank),
+      lockedTier:getRankTier(Number(manager.rank),totalManagers)
+    })).filter(row=>row.lockedTier));
+
+    completedBands++;
+    console.log(
+      `GW ${gameweek} band ${band.name}: sampled ${managers.length}/${band.sampleSize} managers`
+    );
+  }
+
+  if(completedBands===0){
+    console.log(`GW ${gameweek}: no rank tier had enough managers; lock attempt aborted.`);
+    return false;
+  }
+
+  const client=await pool.connect();
+
+  try{
+    await client.query("BEGIN");
+
+    const current=await client.query(
+      `SELECT status FROM fpl_gameweeks WHERE gameweek=$1 FOR UPDATE`,
+      [gameweek]
+    );
+
+    if(!current.rowCount||current.rows[0].status!=="pending"){
+      await client.query("ROLLBACK");
+      return false;
+    }
+
+    for(const row of sampledManagers){
+      const manager=row.manager;
+      await client.query(
+        `INSERT INTO fpl_sample_managers(
+          gameweek,
+          manager_id,
+          locked_rank,
+          locked_tier,
+          manager_name,
+          team_name,
+          overall_points_at_lock
+        )
+        VALUES($1,$2,$3,$4,$5,$6,$7)
+        ON CONFLICT(gameweek,manager_id) DO NOTHING`,
+        [
+          gameweek,
+          Number(manager.entry),
+          row.lockedRank,
+          row.lockedTier,
+          manager.player_name||null,
+          manager.entry_name||null,
+          Number(manager.total)||0
+        ]
+      );
+    }
+
+    await client.query(
+      `UPDATE fpl_gameweeks
+       SET status='locked',
+           locked_at=NOW()
+       WHERE gameweek=$1`,
+      [gameweek]
+    );
+
+    await client.query("COMMIT");
+
+    console.log(
+      `GW ${gameweek} SAMPLE LOCK COMPLETE THROUGH TIER ${completedBands}/${bands.length}; cohort=${sampledManagers.length}`
+    );
+
+    return true;
+  }catch(error){
+    try{
+      await client.query("ROLLBACK");
+    }catch(rollbackError){
+      console.error(`GW ${gameweek}: rollback failed:`,rollbackError.message);
+    }
+    throw error;
+  }finally{
+    client.release();
+  }
+}
 async function captureGameweekPicks(gameweek){
   const row=await pool.query(
     `SELECT status,deadline,picks_captured_at
