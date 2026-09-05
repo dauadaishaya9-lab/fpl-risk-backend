@@ -228,6 +228,19 @@ async function captureGameweekPicks(gameweek){
   try{
     await client.query("BEGIN");
 
+    // Atomically replace the entire pick snapshot.
+    // Failed managers must not retain stale picks from the previous snapshot.
+    await client.query(
+      `UPDATE fpl_sample_managers
+       SET picks=NULL,
+           active_chip=NULL,
+           captain=NULL,
+           triple_captain=NULL,
+           picks_captured_at=NULL
+       WHERE gameweek=$1`,
+      [gameweek]
+    );
+
     for(const item of refreshed){
       await client.query(
         `UPDATE fpl_sample_managers
