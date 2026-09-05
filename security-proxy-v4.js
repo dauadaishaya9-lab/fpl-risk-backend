@@ -369,21 +369,12 @@ async function start() {
   try {
     await initDatabase();
     process.env.PORT = String(INTERNAL_PORT);
-    process.env.DEFER_SCHEDULER = "1";
     backendModule = await import("./server.js");
+    await backendModule.readyPromise;
 
     backendReady = true;
     console.log(`Security gateway HEALTHY on ${PUBLIC_PORT}; internal backend ready on ${INTERNAL_PORT}.`);
-    console.log("Background FPL snapshot collection is starting after health is established.");
-
-    setImmediate(() => {
-      try {
-        backendModule.startScheduler();
-        console.log("BACKGROUND SCHEDULER STARTED: server.js owns the snapshot lifecycle.");
-      } catch (error) {
-        console.error("BACKGROUND SCHEDULER START FAILED:", error.message);
-      }
-    });
+    console.log("Background FPL snapshot collection is owned and started by server.js.");
   } catch (error) {
     console.error("FATAL STARTUP ERROR:", error.message);
     process.exit(1);
