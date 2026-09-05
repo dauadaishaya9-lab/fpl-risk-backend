@@ -1,6 +1,6 @@
 import http from "node:http";
 import pg from "pg";
-import { deterministicRanks, standingsPageForRank } from "./sampling.js";
+import { deterministicRanks, standingsPageForRank, samplingBands, tierForRank } from "./sampling.js";
 import { fetchJSON } from "./fpl-fetch.js";
 
 const { Pool } = pg;
@@ -13,17 +13,6 @@ const LOCK_HOURS_BEFORE_DEADLINE = 1;
 const PICK_REFRESH_INTERVAL_MS = 12 * 60 * 60 * 1000;
 const PICK_RETRY_DELAY_MS = 60 * 1000;
 const FPL_CACHE_TTL = 2 * 60 * 1000;
-const FIXED_BANDS = [
-  { name:"1-10000", min:1, max:10000, sampleSize:10 },
-  { name:"10001-50000", min:10001, max:50000, sampleSize:15 },
-  { name:"50001-100000", min:50001, max:100000, sampleSize:20 },
-  { name:"100001-250000", min:100001, max:250000, sampleSize:25 },
-  { name:"250001-500000", min:250001, max:500000, sampleSize:30 },
-  { name:"500001-1000000", min:500001, max:1000000, sampleSize:35 }
-];
-const MILLION_BAND_START = 1000001;
-const MILLION_BAND_SIZE = 1000000;
-const MILLION_BAND_SAMPLE_SIZE = 60;
 const pool = DATABASE_URL ? new Pool({ connectionString:DATABASE_URL, ssl:{rejectUnauthorized:false}, max:5, idleTimeoutMillis:30000, connectionTimeoutMillis:10000 }) : null;
 const runtime = { refreshing:false, lastRefreshAttempt:null, lastSuccessfulRefresh:null, lastError:null, nextScheduledRun:null };
 let fplCache = { data:null, expiresAt:0 };
@@ -31,17 +20,6 @@ let schedulerStarted = false;
 let schedulerTimer = null;
 
 function getSeasonLabel(date=new Date()) { const year=date.getUTCMonth()>=6?date.getUTCFullYear():date.getUTCFullYear()-1; return `${year}/${String(year+1).slice(-2)}`; }
-function getSamplingBands(totalManagers) {
-  const total = Math.max(0, Math.floor(Number(totalManagers)||0));
-  const bands = FIXED_BANDS.map(b => ({...b}));
-  if (total >= MILLION_BAND_START) {
-    for (let min=MILLION_BAND_START; min<=total; min+=MILLION_BAND_SIZE) {
-      const max=Math.min(min+MILLION_BAND_SIZE-1,total);
-      bands.push({name:`${min}-${max}`,min,max,sampleSize:Math.min(MILLION_BAND_SAMPLE_SIZE,max-min+1)});
-    }
-  }
-  return bands;
-}
 function sendJSON(res,status,data,extraHeaders={}) { res.writeHead(status,{"Content-Type":"application/json; charset=utf-8","Cache-Control":"no-store",...extraHeaders}); res.end(JSON.stringify(data)); }
 async function getFPLData() { const now=Date.now(); if(fplCache.data&&now<fplCache.expiresAt)return fplCache.data; const data=await fetchJSON(FPL_URL,20000,{label:"bootstrap-static"}); fplCache={data,expiresAt:now+FPL_CACHE_TTL}; return data; }
 function getEvent(data,gameweek){ return data.events.find(event=>event.id===gameweek)||null; }
@@ -104,7 +82,6 @@ async function saveGameweekSchedule(fplData){
   for(const event of fplData.events){ if(!event.deadline_time)continue; const deadline=new Date(event.deadline_time); const lockTime=new Date(deadline.getTime()-LOCK_HOURS_BEFORE_DEADLINE*60*60*1000); await pool.query(`INSERT INTO fpl_gameweeks(gameweek,season,deadline,lock_time,total_managers) VALUES($1,$2,$3,$4,$5) ON CONFLICT(gameweek) DO UPDATE SET season=EXCLUDED.season,deadline=EXCLUDED.deadline,lock_time=EXCLUDED.lock_time,total_managers=EXCLUDED.total_managers`,[event.id,season,deadline,lockTime,Number(fplData.total_players)||0]); }
   return true;
 }
-function getRankTier(rank,totalManagers){ return getSamplingBands(totalManagers).find(b=>rank>=b.min&&rank<=b.max)?.name||null; }
 
 async function lockGameweekSamples(gameweek,fplData){
   const event=getEvent(fplData,gameweek);
@@ -138,7 +115,7 @@ async function lockGameweekSamples(gameweek,fplData){
     throw new Error("FPL total manager count is unavailable.");
   }
 
-  const bands=getSamplingBands(totalManagers);
+  const bands=samplingBands(totalManagers);
   const season=getSeasonLabel();
   const sampledManagers=[];
   let completedBands=0;
@@ -161,7 +138,7 @@ async function lockGameweekSamples(gameweek,fplData){
     sampledManagers.push(...managers.map(manager=>({
       manager,
       lockedRank:Number(manager.rank),
-      lockedTier:getRankTier(Number(manager.rank),totalManagers)
+      lockedTier:tierForRank(Number(manager.rank),totalManagers)?.name||null
     })).filter(row=>row.lockedTier));
 
     completedBands++;
@@ -422,7 +399,7 @@ function buildBandFromRows(band,rows){
   const ownership={},captaincy={},tripleCaptaincy={},managers=[]; for(const row of rows){ if(!Array.isArray(row.picks))continue; const picks=row.picks; const captain=picks.find(p=>p.is_captain===true); const triple=picks.find(p=>p.is_captain===true&&Number(p.multiplier)===3); for(const pick of picks){const id=String(pick.element); ownership[id]=(ownership[id]||0)+1;} if(captain){const id=String(captain.element);captaincy[id]=(captaincy[id]||0)+1;} if(triple){const id=String(triple.element);tripleCaptaincy[id]=(tripleCaptaincy[id]||0)+1;} managers.push({rank:row.locked_rank,managerId:row.manager_id,managerName:row.manager_name,teamName:row.team_name,overallPoints:row.overall_points_at_lock,lockedTier:band.name,activeChip:row.active_chip,captain:row.captain,tripleCaptain:row.triple_captain,picks}); }
   const n=managers.length; const pct=counts=>Object.fromEntries(Object.entries(counts).map(([id,c])=>[id,n?Number((c/n*100).toFixed(1)):0])); return {band:band.name,rankRange:{min:band.min,max:band.max},requestedSampleSize:band.sampleSize,successfulSampleSize:n,managers,ownership,ownershipPercent:pct(ownership),captaincy,captaincyPercent:pct(captaincy),tripleCaptaincy,tripleCaptainPercent:pct(tripleCaptaincy)};
 }
-async function getCompletedRiskData(){ const r=await pool.query(`SELECT gameweek,season,total_managers,created_at FROM fpl_gameweeks WHERE status='complete' ORDER BY gameweek DESC LIMIT 1`); if(!r.rowCount)return null; const gw=r.rows[0]; const bands=getSamplingBands(gw.total_managers); const rows=await pool.query(`SELECT gameweek,manager_id,locked_rank,locked_tier,manager_name,team_name,overall_points_at_lock,picks,active_chip,captain,triple_captain FROM fpl_sample_managers WHERE gameweek=$1 AND picks IS NOT NULL ORDER BY locked_rank ASC`,[gw.gameweek]); const completedBands=bands.map(b=>({band:b,rows:rows.rows.filter(r=>r.locked_rank>=b.min&&r.locked_rank<=b.max)})).filter(x=>x.rows.length>0); return {season:gw.season,gameweek:gw.gameweek,totalManagers:gw.total_managers,bands:completedBands.map(x=>buildBandFromRows(x.band,x.rows)),createdAt:gw.created_at,samplingPolicy:{lockHoursBeforeDeadline:LOCK_HOURS_BEFORE_DEADLINE,rankSource:"overall standings at lock time",picksSource:"manager GW picks; latest valid snapshot refreshed every 12 hours",sampling:"deterministic random rank positions; 60 managers per million-rank band from 1,000,001 onward; collection stops at the last tier with a complete requested manager sample"}}; }
+async function getCompletedRiskData(){ const r=await pool.query(`SELECT gameweek,season,total_managers,created_at FROM fpl_gameweeks WHERE status='complete' ORDER BY gameweek DESC LIMIT 1`); if(!r.rowCount)return null; const gw=r.rows[0]; const bands=samplingBands(gw.total_managers); const rows=await pool.query(`SELECT gameweek,manager_id,locked_rank,locked_tier,manager_name,team_name,overall_points_at_lock,picks,active_chip,captain,triple_captain FROM fpl_sample_managers WHERE gameweek=$1 AND picks IS NOT NULL ORDER BY locked_rank ASC`,[gw.gameweek]); const completedBands=bands.map(b=>({band:b,rows:rows.rows.filter(r=>r.locked_rank>=b.min&&r.locked_rank<=b.max)})).filter(x=>x.rows.length>0); return {season:gw.season,gameweek:gw.gameweek,totalManagers:gw.total_managers,bands:completedBands.map(x=>buildBandFromRows(x.band,x.rows)),createdAt:gw.created_at,samplingPolicy:{lockHoursBeforeDeadline:LOCK_HOURS_BEFORE_DEADLINE,rankSource:"overall standings at lock time",picksSource:"manager GW picks; latest valid snapshot refreshed every 12 hours",sampling:"deterministic random rank positions; 60 managers per million-rank band from 1,000,001 onward; collection stops at the last tier with a complete requested manager sample"}}; }
 
 function clearSchedulerTimer(){ if(schedulerTimer){clearTimeout(schedulerTimer);schedulerTimer=null;} runtime.nextScheduledRun=null; }
 

@@ -1,23 +1,17 @@
 import pg from "pg";
 import { decisionExposure, exposureDistribution, exposurePercentile, relativeExpectedSwing } from "./exposure-model.js";
+import { samplingBands, tierForRank } from "./sampling.js";
 const { Pool } = pg;
 const FPL_URL="https://fantasy.premierleague.com/api/bootstrap-static/";
 const ENTRY_URL="https://fantasy.premierleague.com/api/entry/";
 export const TRIAL_LIMIT=3;
 export const OWNER_CLERK_USER_ID=process.env.OWNER_CLERK_USER_ID||"";
 export function isOwner(userId){return typeof userId==="string"&&!!OWNER_CLERK_USER_ID&&userId===OWNER_CLERK_USER_ID;}
-export const RANK_TIERS=[{name:"1-10000",min:1,max:10000},{name:"10001-50000",min:10001,max:50000},{name:"50001-100000",min:50001,max:100000},{name:"100001-250000",min:100001,max:250000},{name:"250001-500000",min:250001,max:500000},{name:"500001-1000000",min:500001,max:1000000}];
-const MILLION_BAND_START=1000001;
-const MILLION_BAND_SIZE=1000000;
-const MILLION_BAND_SAMPLE_SIZE=60;
-const SAMPLE_SIZES={"1-10000":10,"10001-50000":15,"50001-100000":20,"100001-250000":25,"250001-500000":30,"500001-1000000":35};
 const pool=process.env.DATABASE_URL?new Pool({connectionString:process.env.DATABASE_URL,ssl:{rejectUnauthorized:false},max:5,idleTimeoutMillis:30000,connectionTimeoutMillis:10000}):null;
 let bootstrapCache={data:null,expiresAt:0};
 function currentSeasonKey(bootstrap){const current=bootstrap?.events?.find?.(e=>e?.is_current);if(typeof current?.season==="string"&&current.season)return current.season;const now=new Date(),year=now.getUTCFullYear();return now.getUTCMonth()+1>=8?`${year}/${String(year+1).slice(-2)}`:`${year-1}/${String(year).slice(-2)}`;}
 async function fetchJSON(url){const c=new AbortController(),t=setTimeout(()=>c.abort(),15000);try{const r=await fetch(url,{signal:c.signal,headers:{"User-Agent":"FPL-Risk/1.0"}});if(!r.ok)throw new Error(`HTTP ${r.status}`);return await r.json();}finally{clearTimeout(t);}}
 async function getBootstrap(){if(bootstrapCache.data&&bootstrapCache.expiresAt>Date.now())return bootstrapCache.data;const data=await fetchJSON(FPL_URL);bootstrapCache={data,expiresAt:Date.now()+120000};return data;}
-function samplingBands(totalManagers){const total=Math.max(0,Math.floor(Number(totalManagers)||0));const bands=RANK_TIERS.map(t=>({...t,sampleSize:SAMPLE_SIZES[t.name]}));for(let min=MILLION_BAND_START;min<=total;min+=MILLION_BAND_SIZE){const max=Math.min(min+MILLION_BAND_SIZE-1,total);bands.push({name:`${min}-${max}`,min,max,sampleSize:Math.min(MILLION_BAND_SAMPLE_SIZE,max-min+1)});}return bands;}
-function tierForRank(rank,totalManagers){return samplingBands(totalManagers).find(t=>rank>=t.min&&rank<=t.max)||null;}
 function validateUserId(userId){if(!userId||typeof userId!=="string"||userId.length>256)throw Object.assign(new Error("Invalid authenticated user"),{status:401,code:"INVALID_AUTH_USER"});}
 async function verifyFplEntryLive(fplId){if(!Number.isSafeInteger(fplId)||fplId<=0)throw Object.assign(new Error("Invalid FPL Team ID"),{status:400,code:"INVALID_FPL_TEAM_ID"});const season=currentSeasonKey(await getBootstrap());let manager;try{manager=await fetchJSON(`${ENTRY_URL}${fplId}/`);}catch{throw Object.assign(new Error("FPL Team ID could not be verified"),{status:404,code:"FPL_TEAM_NOT_FOUND"});}const rank=Number(manager.summary_overall_rank);if(Number(manager.id)!==fplId||!Number.isSafeInteger(rank)||rank<1)throw Object.assign(new Error("FPL Team ID could not be verified for the current season"),{status:404,code:"FPL_TEAM_NOT_FOUND"});return{fplId,season,rank,playerName:`${manager.player_first_name||""} ${manager.player_last_name||""}`.trim(),teamName:manager.name||null};}
 export async function verifyFplEntry(fplId){return verifyFplEntryLive(fplId);}
