@@ -326,10 +326,11 @@ export function getSchedulerHealth(){
   const healthy=successAge <= 30*60*1000;
   return {healthy,reason:healthy?"recently_completed":"no_active_schedule",refreshing:false,nextScheduledRun:null,lastRefreshAttempt:runtime.lastRefreshAttempt,lastSuccessfulRefresh:runtime.lastSuccessfulRefresh,lastError:runtime.lastError};
 }
-async function scheduleNextRun(){
+async function scheduleNextRun(currentGameweek){
   if(!pool||!schedulerStarted)return;
   clearSchedulerTimer();
   try{
+    if(!Number.isFinite(Number(currentGameweek)))return;
     const result=await pool.query(`SELECT gameweek,status,lock_time,deadline,picks_captured_at,
 CASE
   WHEN status='pending' AND deadline <= NOW() THEN NOW() + INTERVAL '15 minutes'
@@ -341,28 +342,24 @@ CASE
   )
   END AS run_at
 FROM fpl_gameweeks
-WHERE
-  (status='pending' AND deadline > NOW())
-  OR
-  (status='pending' AND deadline <= NOW()
-    AND deadline = (
-      SELECT MAX(deadline)
-      FROM fpl_gameweeks
-      WHERE status='pending'
-        AND deadline <= NOW()
-    ))
-  OR
-  (status='locked' AND deadline <= NOW() AND picks_captured_at IS NULL)
-  OR
-  (status='complete' AND picks_captured_at IS NOT NULL
-    AND picks_captured_at + INTERVAL '12 hours' <= NOW())
+WHERE gameweek=$1
+  AND (
+    (status='pending' AND deadline > NOW())
+    OR
+    (status='pending' AND deadline <= NOW())
+    OR
+    (status='locked' AND deadline <= NOW() AND picks_captured_at IS NULL)
+    OR
+    (status='complete' AND picks_captured_at IS NOT NULL
+      AND picks_captured_at + INTERVAL '12 hours' <= NOW())
+  )
 ORDER BY
   CASE
     WHEN status='pending' AND deadline <= NOW() THEN 0
     ELSE 1
   END,
   run_at ASC
-LIMIT 1`);
+LIMIT 1`,[Number(currentGameweek)]);
     if(!result.rowCount)return;
     const row=result.rows[0];
     const target=new Date(row.run_at).getTime();
@@ -381,13 +378,14 @@ async function refreshScheduler(){
   if(runtime.refreshing||!pool)return;
   runtime.refreshing=true;
   runtime.lastRefreshAttempt=new Date().toISOString();
+  let currentEvent=null;
   try{
     const fplData=await getFPLData();
     const scheduleReady=await saveGameweekSchedule(fplData);
     if(!scheduleReady){
       console.log("SCHEDULER: schedule persistence not ready; continuing existing snapshot processing.");
     }
-    const currentEvent=fplData.events.find(event=>event.deadline_time&&!event.finished)||null;
+    currentEvent=fplData.events.find(event=>event.deadline_time&&!event.finished)||null;
     for(const event of fplData.events){
       if(!event.deadline_time)continue;
       const deadline=new Date(event.deadline_time);
@@ -401,16 +399,20 @@ async function refreshScheduler(){
         }
       }
     }
-    const locked=await pool.query(`SELECT gameweek,deadline,picks_captured_at
+    const currentGameweek=Number(currentEvent?.id);
+    const locked=Number.isFinite(currentGameweek)
+      ? await pool.query(`SELECT gameweek,deadline,picks_captured_at
 FROM fpl_gameweeks
-WHERE deadline <= NOW()
+WHERE gameweek=$1
+  AND deadline <= NOW()
   AND (
     (status='locked' AND picks_captured_at IS NULL)
     OR
     (status='complete' AND picks_captured_at IS NOT NULL
       AND picks_captured_at + INTERVAL '12 hours' <= NOW())
   )
-ORDER BY COALESCE(picks_captured_at,deadline) ASC`);
+ORDER BY COALESCE(picks_captured_at,deadline) ASC`,[currentGameweek])
+      : {rows:[]};
     for(const row of locked.rows){
       try{await captureGameweekPicks(row.gameweek);}catch(error){console.error(`GW ${row.gameweek} PICK CAPTURE FAILED:`,error.message);}
     }
@@ -421,7 +423,7 @@ ORDER BY COALESCE(picks_captured_at,deadline) ASC`);
     console.error("SCHEDULER FAILED:",error.message);
   }finally{
     runtime.refreshing=false;
-    await scheduleNextRun();
+    await scheduleNextRun(currentEvent?.id);
   }
 }
 export function startScheduler(){ if(schedulerStarted||!pool)return; schedulerStarted=true; refreshScheduler().catch(error=>console.error("BACKGROUND SCHEDULER FAILED:",error.message)); }
