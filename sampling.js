@@ -31,16 +31,16 @@ export function uniqueStandingPages(ranks, pageSize = 50) {
 }
 
 const FIXED_BANDS = [
-  { name:"1-10000", min:1, max:10000, sampleSize:10 },
-  { name:"10001-50000", min:10001, max:50000, sampleSize:15 },
-  { name:"50001-100000", min:50001, max:100000, sampleSize:20 },
-  { name:"100001-250000", min:100001, max:250000, sampleSize:25 },
-  { name:"250001-500000", min:250001, max:500000, sampleSize:30 },
-  { name:"500001-1000000", min:500001, max:1000000, sampleSize:35 }
+  { name:"1-10000", min:1, max:10000, sampleSize:20 },
+  { name:"10001-50000", min:10001, max:50000, sampleSize:30 },
+  { name:"50001-100000", min:50001, max:100000, sampleSize:40 },
+  { name:"100001-250000", min:100001, max:250000, sampleSize:50 },
+  { name:"250001-500000", min:250001, max:500000, sampleSize:60 },
+  { name:"500001-1000000", min:500001, max:1000000, sampleSize:70 }
 ];
 
 const MILLION_BAND_START = 1000001;
-const MILLION_BAND_SIZE = 1000000;
+const MILLION_BAND_SIZE = 500000;
 const MILLION_BAND_SAMPLE_SIZE = 60;
 
 export function samplingBands(totalManagers) {
