@@ -23,10 +23,9 @@ function getSeasonLabel(date=new Date()) { const year=date.getUTCMonth()>=6?date
 function sendJSON(res,status,data,extraHeaders={}) { res.writeHead(status,{"Content-Type":"application/json; charset=utf-8","Cache-Control":"no-store",...extraHeaders}); res.end(JSON.stringify(data)); }
 async function getFPLData() { const now=Date.now(); if(fplCache.data&&now<fplCache.expiresAt)return fplCache.data; const data=await fetchJSON(FPL_URL,20000,{label:"bootstrap-static"}); fplCache={data,expiresAt:now+FPL_CACHE_TTL}; return data; }
 function getEvent(data,gameweek){ return data.events.find(event=>event.id===gameweek)||null; }
-const STANDINGS_RETRY_DELAYS_MS = [60_000, 120_000, 180_000, 240_000, 300_000];
-
 async function getStandingsPage(page){
-  const maxAttempts=STANDINGS_RETRY_DELAYS_MS.length+1;
+  const maxAttempts=3;
+  const retryDelayMs=2000;
   let lastError=null;
   for(let attempt=1;attempt<=maxAttempts;attempt++){
     try{
@@ -34,11 +33,7 @@ async function getStandingsPage(page){
     }catch(error){
       lastError=error;
       console.error(`Failed standings page ${page} attempt ${attempt}/${maxAttempts}:`,error.message);
-      const delay=STANDINGS_RETRY_DELAYS_MS[attempt-1];
-      if(delay!==undefined){
-        console.log(`Waiting ${delay/1000}s before retrying standings page ${page}...`);
-        await new Promise(resolve=>setTimeout(resolve,delay));
-      }
+      if(attempt<maxAttempts)await new Promise(resolve=>setTimeout(resolve,retryDelayMs));
     }
   }
   throw lastError;
@@ -135,9 +130,9 @@ async function lockGameweekSamples(gameweek,fplData){
 
     if(managers.length<band.sampleSize){
       console.log(
-        `GW ${gameweek} band ${band.name}: only found ${managers.length}/${band.sampleSize} managers. Skipping this band (nothing saved for it); every other successful band will still be locked, and the calculator will fall back to the nearest successful band below it.`
+        `GW ${gameweek} band ${band.name}: insufficient managers ${managers.length}/${band.sampleSize}; lock attempt aborted and scheduler will retry later.`
       );
-      continue;
+      return false;
     }
 
     sampledManagers.push(...managers.map(manager=>({
