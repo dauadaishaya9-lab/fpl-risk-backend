@@ -535,6 +535,28 @@ ORDER BY COALESCE(picks_captured_at,deadline) ASC`,[currentGameweek])
   }
 }
 export function startScheduler(){ if(schedulerStarted||!pool)return; schedulerStarted=true; refreshScheduler().catch(error=>console.error("BACKGROUND SCHEDULER FAILED:",error.message)); }
+
+async function relabelMismatchedTiers(){
+  if(!pool)return;
+  const gws=await pool.query(`SELECT gameweek,total_managers FROM fpl_gameweeks WHERE status IN ('locked','complete')`);
+  let totalFixed=0;
+  for(const gw of gws.rows){
+    const totalManagers=Number(gw.total_managers);
+    const managers=await pool.query(`SELECT manager_id,locked_rank,locked_tier FROM fpl_sample_managers WHERE gameweek=$1`,[gw.gameweek]);
+    for(const row of managers.rows){
+      const correct=tierForRank(Number(row.locked_rank),totalManagers);
+      if(correct&&correct.name!==row.locked_tier){
+        await pool.query(`UPDATE fpl_sample_managers SET locked_tier=$1 WHERE gameweek=$2 AND manager_id=$3`,[correct.name,gw.gameweek,row.manager_id]);
+        totalFixed++;
+      }
+    }
+  }
+  if(totalFixed>0){
+    console.log(`[SELF-HEAL] Relabeled ${totalFixed} manager row(s) to match the current tier rules.`);
+  }else{
+    console.log("[SELF-HEAL] All stored tier labels already match the current rules.");
+  }
+}
 const server=http.createServer(async(req,res)=>{ const url=new URL(req.url,`http://${req.headers.host||"localhost"}`); if(req.method!=="GET"){sendJSON(res,405,{error:"Method not allowed"},{Allow:"GET"});return;} if(url.pathname==="/"){let databaseReady=false;try{if(pool){await pool.query("SELECT 1");databaseReady=true;}}catch{} sendJSON(res,200,{status:"ok",databaseConfigured:Boolean(pool),databaseReady,refreshing:runtime.refreshing,lastRefreshAttempt:runtime.lastRefreshAttempt,lastSuccessfulRefresh:runtime.lastSuccessfulRefresh,lastError:runtime.lastError,nextScheduledRun:runtime.nextScheduledRun,lockHoursBeforeDeadline:LOCK_HOURS_BEFORE_DEADLINE,pickRefreshIntervalHours:PICK_REFRESH_INTERVAL_MS/3600000});return;} if(url.pathname==="/api/sample-tiers"){try{const result=await getCompletedRiskData();if(!result){sendJSON(res,503,{error:"No completed locked sample is ready yet."});return;}sendJSON(res,200,result);}catch(error){sendJSON(res,500,{error:"Could not load risk data.",details:error.message});}return;} if(url.pathname==="/api/cache"){if(!pool){sendJSON(res,503,{error:"PostgreSQL is not configured."});return;}try{const result=await pool.query(`SELECT gameweek,season,status,deadline,lock_time,locked_at,picks_captured_at,total_managers FROM fpl_gameweeks ORDER BY gameweek DESC`);sendJSON(res,200,{lockHoursBeforeDeadline:LOCK_HOURS_BEFORE_DEADLINE,pickRefreshIntervalHours:PICK_REFRESH_INTERVAL_MS/3600000,gameweeks:result.rows,scheduler:runtime});}catch(error){sendJSON(res,500,{error:error.message});}return;} if(url.pathname.startsWith("/api/entry/")){const entryId=url.pathname.split("/api/entry/")[1];if(!entryId||!/^[0-9]+$/.test(entryId)){sendJSON(res,400,{error:"Invalid FPL ID"});return;}try{const data=await fetchJSON(`${ENTRY_URL}${entryId}/`,20000,{label:`entry ${entryId}`});sendJSON(res,200,{id:data.id,playerName:`${data.player_first_name} ${data.player_last_name}`,teamName:data.name,overallRank:data.summary_overall_rank,overallPoints:data.summary_overall_points});}catch(error){sendJSON(res,502,{error:"Could not fetch FPL entry",details:error.message});}return;} if(url.pathname==="/api/fpl"){try{sendJSON(res,200,await getFPLData(),{"Cache-Control":"public, max-age=60"});}catch(error){sendJSON(res,502,{error:error.message});}return;} sendJSON(res,404,{error:"Not found"}); });
 async function start(){
   server.listen(PORT,"127.0.0.1",()=>{console.log(`Internal backend listening on loopback port ${PORT}; scheduler will initialize in background.`);console.log(`Sample lock policy: ${LOCK_HOURS_BEFORE_DEADLINE} hour before deadline.`);console.log(`FPL bootstrap cache TTL: ${FPL_CACHE_TTL/1000}s.`);});
@@ -542,6 +564,7 @@ async function start(){
     try{
       await initDatabase();
       console.log("PostgreSQL connected and schema ready.");
+      await relabelMismatchedTiers();
       startScheduler();
     }catch(error){
       runtime.lastError=error.message;
