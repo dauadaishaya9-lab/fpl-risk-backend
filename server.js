@@ -10,7 +10,7 @@ const FPL_URL = "https://fantasy.premierleague.com/api/bootstrap-static/";
 const ENTRY_URL = "https://fantasy.premierleague.com/api/entry/";
 const STANDINGS_URL = "https://fantasy.premierleague.com/api/leagues-classic/314/standings/";
 const LOCK_HOURS_BEFORE_DEADLINE = 1;
-const PICK_REFRESH_INTERVAL_MS = 12 * 60 * 60 * 1000;
+const PICK_REFRESH_INTERVAL_MS = 7 * 24 * 60 * 60 * 1000;
 const PICK_RETRY_DELAY_MS = 60 * 1000;
 const FPL_CACHE_TTL = 2 * 60 * 1000;
 const pool = DATABASE_URL ? new Pool({ connectionString:DATABASE_URL, ssl:{rejectUnauthorized:false}, max:5, idleTimeoutMillis:30000, connectionTimeoutMillis:10000 }) : null;
@@ -245,28 +245,33 @@ async function captureGameweekPicks(gameweek){
 
   if(Date.now()<deadline.getTime())return false;
 
+  // Once a manager has a valid picks snapshot for this gameweek, FPL itself
+  // locks their picks - there is nothing to "re-check" for them. So each
+  // cycle only chases managers who are still missing a snapshot. A manager
+  // who fails never affects any other manager, and never loses data they
+  // already have.
   const managers=await pool.query(
-    `SELECT manager_id,locked_rank,locked_tier
+    `SELECT manager_id,locked_rank
      FROM fpl_sample_managers
      WHERE gameweek=$1
+       AND picks IS NULL
      ORDER BY locked_rank ASC`,
     [gameweek]
   );
 
-  if(!managers.rowCount)return false;
+  if(!managers.rowCount){
+    // Everyone already has valid picks. Nothing to do, but bump the
+    // timestamp so we don't check again until the next full cycle.
+    await pool.query(
+      `UPDATE fpl_gameweeks SET picks_captured_at=NOW() WHERE gameweek=$1`,
+      [gameweek]
+    );
+    return false;
+  }
 
-  const refreshed=[];
-  const successfulByTier=new Map();
-  const totalByTier=new Map();
+  let successCount=0;
 
   for(const manager of managers.rows){
-    const tier=manager.locked_tier;
-
-    totalByTier.set(
-      tier,
-      (totalByTier.get(tier)||0)+1
-    );
-
     try{
       const data=await getManagerPicks(manager.manager_id,gameweek);
       const picks=Array.isArray(data.picks)?data.picks:[];
@@ -275,69 +280,10 @@ async function captureGameweekPicks(gameweek){
         throw new Error(`Expected 15 picks, received ${picks.length}`);
       }
 
-      const captain=picks.find(
-        p=>p.is_captain===true
-      );
+      const captain=picks.find(p=>p.is_captain===true);
+      const triple=picks.find(p=>p.is_captain===true&&Number(p.multiplier)===3);
 
-      const triple=picks.find(
-        p=>p.is_captain===true&&Number(p.multiplier)===3
-      );
-
-      refreshed.push({
-        managerId:manager.manager_id,
-        picks,
-        activeChip:data.active_chip??null,
-        captain:captain?Number(captain.element):null,
-        tripleCaptain:triple?Number(triple.element):null
-      });
-
-      successfulByTier.set(
-        tier,
-        (successfulByTier.get(tier)||0)+1
-      );
-
-    }catch(error){
-      console.error(
-        `GW ${gameweek} manager ${manager.manager_id} picks failed:`,
-        error.message
-      );
-    }
-  }
-
-  const acceptable=[...totalByTier.entries()].every(
-    ([tier,total])=>{
-      const successful=successfulByTier.get(tier)||0;
-      return successful>=Math.ceil(total*0.8);
-    }
-  );
-
-  if(!acceptable){
-    console.log(
-      `GW ${gameweek}: pick snapshot validation failed; existing valid snapshot preserved.`
-    );
-    return false;
-  }
-
-  const client=await pool.connect();
-
-  try{
-    await client.query("BEGIN");
-
-    // Atomically replace the entire pick snapshot.
-    // Failed managers must not retain stale picks from the previous snapshot.
-    await client.query(
-      `UPDATE fpl_sample_managers
-       SET picks=NULL,
-           active_chip=NULL,
-           captain=NULL,
-           triple_captain=NULL,
-           picks_captured_at=NULL
-       WHERE gameweek=$1`,
-      [gameweek]
-    );
-
-    for(const item of refreshed){
-      await client.query(
+      await pool.query(
         `UPDATE fpl_sample_managers
          SET picks=$1,
              active_chip=$2,
@@ -348,36 +294,49 @@ async function captureGameweekPicks(gameweek){
          WHERE gameweek=$5
            AND manager_id=$6`,
         [
-          JSON.stringify(item.picks),
-          item.activeChip,
-          item.captain,
-          item.tripleCaptain,
+          JSON.stringify(picks),
+          data.active_chip??null,
+          captain?Number(captain.element):null,
+          triple?Number(triple.element):null,
           gameweek,
-          item.managerId
+          manager.manager_id
         ]
       );
+
+      successCount++;
+
+    }catch(error){
+      console.error(
+        `GW ${gameweek} manager ${manager.manager_id} picks failed:`,
+        error.message
+      );
+      await pool.query(
+        `UPDATE fpl_sample_managers
+         SET pick_attempts=pick_attempts+1
+         WHERE gameweek=$1
+           AND manager_id=$2`,
+        [gameweek,manager.manager_id]
+      );
     }
-
-    await client.query(
-      `UPDATE fpl_gameweeks
-       SET picks_captured_at=NOW(),
-           status='complete'
-       WHERE gameweek=$1`,
-      [gameweek]
-    );
-
-    await client.query("COMMIT");
-
-  }catch(error){
-    await client.query("ROLLBACK");
-    throw error;
-
-  }finally{
-    client.release();
   }
 
+  if(successCount===0){
+    console.log(
+      `GW ${gameweek}: no new picks captured this cycle (${managers.rowCount} manager(s) still pending); will retry next cycle.`
+    );
+    return false;
+  }
+
+  await pool.query(
+    `UPDATE fpl_gameweeks
+     SET picks_captured_at=NOW(),
+         status='complete'
+     WHERE gameweek=$1`,
+    [gameweek]
+  );
+
   console.log(
-    `GW ${gameweek}: valid pick snapshot ${isInitialCapture?"created":"refreshed"} for ${refreshed.length} managers.`
+    `GW ${gameweek}: ${isInitialCapture?"created":"refreshed"} snapshot for ${successCount} manager(s); ${managers.rowCount-successCount} still pending.`
   );
 
   if(isInitialCapture){
@@ -404,7 +363,7 @@ function buildBandFromRows(band,rows){
   const ownership={},captaincy={},tripleCaptaincy={},managers=[]; for(const row of rows){ if(!Array.isArray(row.picks))continue; const picks=row.picks; const captain=picks.find(p=>p.is_captain===true); const triple=picks.find(p=>p.is_captain===true&&Number(p.multiplier)===3); for(const pick of picks){const id=String(pick.element); ownership[id]=(ownership[id]||0)+1;} if(captain){const id=String(captain.element);captaincy[id]=(captaincy[id]||0)+1;} if(triple){const id=String(triple.element);tripleCaptaincy[id]=(tripleCaptaincy[id]||0)+1;} managers.push({rank:row.locked_rank,managerId:row.manager_id,managerName:row.manager_name,teamName:row.team_name,overallPoints:row.overall_points_at_lock,lockedTier:band.name,activeChip:row.active_chip,captain:row.captain,tripleCaptain:row.triple_captain,picks}); }
   const n=managers.length; const pct=counts=>Object.fromEntries(Object.entries(counts).map(([id,c])=>[id,n?Number((c/n*100).toFixed(1)):0])); return {band:band.name,rankRange:{min:band.min,max:band.max},requestedSampleSize:band.sampleSize,successfulSampleSize:n,managers,ownership,ownershipPercent:pct(ownership),captaincy,captaincyPercent:pct(captaincy),tripleCaptaincy,tripleCaptainPercent:pct(tripleCaptaincy)};
 }
-async function getCompletedRiskData(){ const r=await pool.query(`SELECT gameweek,season,total_managers,created_at FROM fpl_gameweeks WHERE status='complete' ORDER BY gameweek DESC LIMIT 1`); if(!r.rowCount)return null; const gw=r.rows[0]; const bands=samplingBands(gw.total_managers); const rows=await pool.query(`SELECT gameweek,manager_id,locked_rank,locked_tier,manager_name,team_name,overall_points_at_lock,picks,active_chip,captain,triple_captain FROM fpl_sample_managers WHERE gameweek=$1 AND picks IS NOT NULL ORDER BY locked_rank ASC`,[gw.gameweek]); const completedBands=bands.map(b=>({band:b,rows:rows.rows.filter(r=>r.locked_rank>=b.min&&r.locked_rank<=b.max)})).filter(x=>x.rows.length>0); return {season:gw.season,gameweek:gw.gameweek,totalManagers:gw.total_managers,bands:completedBands.map(x=>buildBandFromRows(x.band,x.rows)),createdAt:gw.created_at,samplingPolicy:{lockHoursBeforeDeadline:LOCK_HOURS_BEFORE_DEADLINE,rankSource:"overall standings at lock time",picksSource:"manager GW picks; latest valid snapshot refreshed every 12 hours",sampling:"deterministic random rank positions; 60 managers per million-rank band from 1,000,001 onward; collection stops at the last tier with a complete requested manager sample"}}; }
+async function getCompletedRiskData(){ const r=await pool.query(`SELECT gameweek,season,total_managers,created_at FROM fpl_gameweeks WHERE status='complete' ORDER BY gameweek DESC LIMIT 1`); if(!r.rowCount)return null; const gw=r.rows[0]; const bands=samplingBands(gw.total_managers); const rows=await pool.query(`SELECT gameweek,manager_id,locked_rank,locked_tier,manager_name,team_name,overall_points_at_lock,picks,active_chip,captain,triple_captain FROM fpl_sample_managers WHERE gameweek=$1 AND picks IS NOT NULL ORDER BY locked_rank ASC`,[gw.gameweek]); const completedBands=bands.map(b=>({band:b,rows:rows.rows.filter(r=>r.locked_rank>=b.min&&r.locked_rank<=b.max)})).filter(x=>x.rows.length>0); return {season:gw.season,gameweek:gw.gameweek,totalManagers:gw.total_managers,bands:completedBands.map(x=>buildBandFromRows(x.band,x.rows)),createdAt:gw.created_at,samplingPolicy:{lockHoursBeforeDeadline:LOCK_HOURS_BEFORE_DEADLINE,rankSource:"overall standings at lock time",picksSource:"manager GW picks; latest valid snapshot refreshed weekly",sampling:"deterministic random rank positions; 60 managers per million-rank band from 1,000,001 onward; collection stops at the last tier with a complete requested manager sample"}}; }
 
 function clearSchedulerTimer(){ if(schedulerTimer){clearTimeout(schedulerTimer);schedulerTimer=null;} runtime.nextScheduledRun=null; }
 
@@ -445,7 +404,7 @@ CASE
   WHEN status='pending' THEN lock_time
   WHEN picks_captured_at IS NULL THEN deadline
   ELSE GREATEST(
-    picks_captured_at + INTERVAL '12 hours',
+    picks_captured_at + INTERVAL '7 days',
     NOW() + INTERVAL '15 minutes'
   )
   END AS run_at
@@ -459,7 +418,7 @@ WHERE gameweek=$1
     (status='locked' AND deadline <= NOW() AND picks_captured_at IS NULL)
     OR
     (status='complete' AND picks_captured_at IS NOT NULL
-      AND picks_captured_at + INTERVAL '12 hours' <= NOW())
+      AND picks_captured_at + INTERVAL '7 days' <= NOW())
   )
 ORDER BY
   CASE
@@ -517,7 +476,7 @@ WHERE gameweek=$1
     (status='locked' AND picks_captured_at IS NULL)
     OR
     (status='complete' AND picks_captured_at IS NOT NULL
-      AND picks_captured_at + INTERVAL '12 hours' <= NOW())
+      AND picks_captured_at + INTERVAL '7 days' <= NOW())
   )
 ORDER BY COALESCE(picks_captured_at,deadline) ASC`,[currentGameweek])
       : {rows:[]};
