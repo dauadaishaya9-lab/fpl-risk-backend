@@ -23,6 +23,8 @@ const CLERK_ISSUER = (process.env.CLERK_ISSUER || "").replace(/\/$/, "");
 const CLERK_JWKS_URL = process.env.CLERK_JWKS_URL || "";
 const CLERK_AUTHORIZED_PARTIES = (process.env.CLERK_AUTHORIZED_PARTIES || "")
   .split(",").map(v => v.trim()).filter(Boolean);
+const CLERK_SECRET_KEY = process.env.CLERK_SECRET_KEY || "";
+const RESEND_API_KEY = process.env.RESEND_API_KEY || "";
 const WINDOW_MS = 60_000;
 const IP_LIMIT = 60;
 const USER_LIMIT = 120;
@@ -325,6 +327,26 @@ const gateway = http.createServer(async (req, res) => {
       }
     }
 
+    if (url.pathname === "/api/premium/notify") {
+      if (req.method !== "POST") return json(res, 405, { error: "Method not allowed" }, { ...responseCors, Allow: "POST,OPTIONS" });
+      try {
+        const email = await getClerkPrimaryEmail(auth.userId);
+        await usagePool.query(
+          "INSERT INTO premium_interest (user_id, email, updated_at) VALUES ($1, $2, NOW()) ON CONFLICT (user_id) DO UPDATE SET email = EXCLUDED.email, updated_at = NOW()",
+          [auth.userId, email]
+        );
+        try {
+          await addResendContact(email);
+        } catch (error) {
+          console.error("RESEND CONTACT SYNC FAILED:", error.message);
+        }
+        return json(res, 200, { success: true }, responseCors);
+      } catch (error) {
+        console.error("PREMIUM NOTIFY FAILED:", error.message);
+        return json(res, 503, { error: "Unable to add you to the notification list right now.", code: "PREMIUM_NOTIFY_FAILED" }, responseCors);
+      }
+    }
+
     return json(res, 404, { error: "Not found" }, responseCors);
   } catch (error) {
     console.error("GATEWAY ERROR:", error.message);
@@ -333,10 +355,46 @@ const gateway = http.createServer(async (req, res) => {
   }
 });
 
+async function getClerkPrimaryEmail(userId) {
+  if (!CLERK_SECRET_KEY) throw new Error("Clerk secret key is not configured.");
+  const response = await fetch("https://api.clerk.com/v1/users/" + encodeURIComponent(userId), {
+    headers: { Authorization: "Bearer " + CLERK_SECRET_KEY }
+  });
+  if (!response.ok) throw new Error("Clerk user lookup failed (" + response.status + ").");
+  const user = await response.json();
+  const primaryId = user.primaryEmailAddressId;
+  const primary = Array.isArray(user.emailAddresses) ? user.emailAddresses.find(email => email.id === primaryId) : null;
+  if (!primary || !primary.emailAddress) throw new Error("No primary email address found.");
+  return primary.emailAddress;
+}
+
+async function addResendContact(email) {
+  if (!RESEND_API_KEY) throw new Error("Resend API key is not configured.");
+  const response = await fetch("https://api.resend.com/contacts", {
+    method: "POST",
+    headers: {
+      Authorization: "Bearer " + RESEND_API_KEY,
+      "Content-Type": "application/json",
+      "User-Agent": "fpl-risk-backend"
+    },
+    body: JSON.stringify({ email, unsubscribed: false })
+  });
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error("Resend contact creation failed (" + response.status + "): " + text.slice(0, 300));
+  }
+}
+
 async function initDatabase() {
   if (!usagePool) throw new Error("DATABASE_URL is required.");
   await usagePool.query(`
-    CREATE TABLE IF NOT EXISTS fpl_current_account_links (
+    CREATE TABLE IF NOT EXISTS premium_interest (
+  user_id TEXT PRIMARY KEY,
+  email TEXT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE TABLE IF NOT EXISTS fpl_current_account_links (
       user_id TEXT PRIMARY KEY,
       season TEXT NOT NULL,
       fpl_entry_id INTEGER NOT NULL UNIQUE,
