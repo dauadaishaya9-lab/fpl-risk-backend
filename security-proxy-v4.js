@@ -25,6 +25,8 @@ const CLERK_AUTHORIZED_PARTIES = (process.env.CLERK_AUTHORIZED_PARTIES || "")
   .split(",").map(v => v.trim()).filter(Boolean);
 const CLERK_SECRET_KEY = process.env.CLERK_SECRET_KEY || "";
 const RESEND_API_KEY = process.env.RESEND_API_KEY || "";
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
+const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || "";
 const WINDOW_MS = 60_000;
 const IP_LIMIT = 60;
 const USER_LIMIT = 120;
@@ -340,6 +342,24 @@ const gateway = http.createServer(async (req, res) => {
         } catch (error) {
           console.error("RESEND CONTACT SYNC FAILED:", error.message);
         }
+
+        const notificationClaim = await usagePool.query(
+          "INSERT INTO premium_owner_notifications (user_id) VALUES ($1) ON CONFLICT (user_id) DO NOTHING RETURNING user_id",
+          [auth.userId]
+        );
+
+        if (notificationClaim.rowCount > 0) {
+          try {
+            await notifyOwnerTelegram(email);
+          } catch (error) {
+            await usagePool.query(
+              "DELETE FROM premium_owner_notifications WHERE user_id = $1",
+              [auth.userId]
+            );
+            console.error("TELEGRAM OWNER NOTIFICATION FAILED:", error.message);
+          }
+        }
+
         return json(res, 200, { success: true }, responseCors);
       } catch (error) {
         console.error("PREMIUM NOTIFY FAILED:", error.message);
@@ -385,6 +405,29 @@ async function addResendContact(email) {
   }
 }
 
+async function notifyOwnerTelegram(email) {
+  if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
+    throw new Error("Telegram notification is not configured.");
+  }
+
+  const response = await fetch(
+    "https://api.telegram.org/bot" + TELEGRAM_BOT_TOKEN + "/sendMessage",
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        chat_id: TELEGRAM_CHAT_ID,
+        text: "🔔 New Premium interest\\nEmail: " + email
+      })
+    }
+  );
+
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error("Telegram notification failed (" + response.status + "): " + text.slice(0, 300));
+  }
+}
+
 async function initDatabase() {
   if (!usagePool) throw new Error("DATABASE_URL is required.");
   await usagePool.query(`
@@ -393,6 +436,10 @@ async function initDatabase() {
   email TEXT NOT NULL,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE TABLE IF NOT EXISTS premium_owner_notifications (
+  user_id TEXT PRIMARY KEY,
+  sent_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 CREATE TABLE IF NOT EXISTS fpl_current_account_links (
       user_id TEXT PRIMARY KEY,
