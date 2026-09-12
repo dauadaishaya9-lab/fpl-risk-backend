@@ -24,6 +24,7 @@ const CLERK_JWKS_URL = process.env.CLERK_JWKS_URL || "";
 const CLERK_AUTHORIZED_PARTIES = (process.env.CLERK_AUTHORIZED_PARTIES || "")
   .split(",").map(v => v.trim()).filter(Boolean);
 const CLERK_SECRET_KEY = process.env.CLERK_SECRET_KEY || "";
+const SCHEDULER_CRON_SECRET = process.env.SCHEDULER_CRON_SECRET || "";
 const RESEND_API_KEY = process.env.RESEND_API_KEY || "";
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || "";
@@ -98,6 +99,18 @@ function tokenFrom(req) {
   const match = String(req.headers.cookie || "").match(/(?:^|;\s*)__session=([^;]+)/);
   if (!match) return null;
   try { return decodeURIComponent(match[1]); } catch { return null; }
+}
+
+function validCronSecret(req) {
+  if (!SCHEDULER_CRON_SECRET) return false;
+  const auth = req.headers.authorization;
+  if (typeof auth !== "string") return false;
+  const match = auth.match(/^Bearer\s+(.+)$/i);
+  if (!match) return false;
+  const provided = Buffer.from(match[1].trim());
+  const expected = Buffer.from(SCHEDULER_CRON_SECRET);
+  if (provided.length !== expected.length) return false;
+  return crypto.timingSafeEqual(provided, expected);
 }
 
 function configError() {
@@ -221,6 +234,39 @@ const gateway = http.createServer(async (req, res) => {
     const responseCors = cors(origin);
     if (req.method === "OPTIONS") { res.writeHead(204, cors(origin)); return res.end(); }
     if (limited(ipBuckets, clientIp(req), IP_LIMIT)) return json(res, 429, { error: "Too many requests." }, { ...responseCors, "Retry-After": "60" });
+    if (url.pathname === "/internal/scheduler/tick") {
+      if (req.method !== "POST") return json(res, 405, { error: "Method not allowed" }, { Allow: "POST" });
+      if (!validCronSecret(req)) return json(res, 401, { error: "Unauthorized" });
+      if (!backendReady || typeof backendModule?.getSchedulerHealth !== "function") {
+        return json(res, 503, { error: "Backend is starting." }, { "Retry-After": "3" });
+      }
+
+      const before = backendModule.getSchedulerHealth();
+      const dueNow = !before.nextScheduledRun || new Date(before.nextScheduledRun).getTime() <= Date.now();
+      let refreshStarted = false;
+
+      if (!before.refreshing && dueNow && typeof backendModule.refreshScheduler === "function") {
+        refreshStarted = true;
+        backendModule.refreshScheduler().catch(error => {
+          console.error("SCHEDULER TICK REFRESH FAILED:", error.message);
+        });
+      }
+
+      const after = backendModule.getSchedulerHealth();
+      return json(res, 200, {
+        ok: true,
+        refreshAlreadyRunning: before.refreshing,
+        refreshStarted,
+        refreshing: after.refreshing,
+        schedulerHealthy: after.healthy,
+        schedulerReason: after.reason,
+        nextScheduledRun: after.nextScheduledRun,
+        lastRefreshAttempt: after.lastRefreshAttempt,
+        lastSuccessfulRefresh: after.lastSuccessfulRefresh,
+        lastError: after.lastError
+      });
+    }
+
     if (url.pathname === "/health" || url.pathname === "/") {
       const schedulerHealth = typeof backendModule?.getSchedulerHealth === "function"
         ? backendModule.getSchedulerHealth()
