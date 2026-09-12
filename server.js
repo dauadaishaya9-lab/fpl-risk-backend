@@ -441,7 +441,7 @@ LIMIT 1`,[Number(currentGameweek)]);
     console.error("SCHEDULER NEXT-RUN CALCULATION FAILED:",error.message);
   }
 }
-async function refreshScheduler(){
+export async function refreshScheduler(){
   if(runtime.refreshing||!pool)return;
   runtime.refreshing=true;
   runtime.lastRefreshAttempt=new Date().toISOString();

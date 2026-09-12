@@ -1,0 +1,19 @@
+name: Scheduler Tick
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+jobs:
+  scheduler:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger backend scheduler
+        run: |
+          curl --fail-with-body \
+            --silent \
+            --show-error \
+            -X POST \
+            -H "Authorization: Bearer ${{ secrets.SCHEDULER_CRON_SECRET }}" \
+            https://fpl-risk-backend.onrender.com/internal/scheduler/tick
