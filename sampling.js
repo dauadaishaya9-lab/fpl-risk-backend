@@ -26,10 +26,6 @@ export function standingsPageForRank(rank, pageSize = 50) {
   return Math.floor((rank - 1) / pageSize) + 1;
 }
 
-export function uniqueStandingPages(ranks, pageSize = 50) {
-  return [...new Set(ranks.map(rank => standingsPageForRank(rank, pageSize)))].sort((a, b) => a - b);
-}
-
 const FIXED_BANDS = [
   { name:"1-10000", min:1, max:10000, sampleSize:20 },
   { name:"10001-50000", min:10001, max:50000, sampleSize:30 },

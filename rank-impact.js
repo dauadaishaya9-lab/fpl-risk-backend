@@ -3,6 +3,7 @@ const ENTRY_URL = "https://fantasy.premierleague.com/api/entry/";
 import { pool } from "./risk-engine.js";
 import { samplingBands } from "./sampling.js";
 import { estimateRankMovement } from "./rank-movement.js";
+import { fetchJSON } from "./fpl-fetch.js";
 
 let subscriptionSchemaReady = false;
 
@@ -51,12 +52,6 @@ export async function isPaidUser(userId) {
   return !!(await getSubscription(userId));
 }
 
-export async function isRankImpactEntitled(userId, isOwner) {
-  if (typeof userId !== "string") return false;
-  if (isOwner(userId)) return true;
-  return isPaidUser(userId);
-}
-
 export async function grantMonthlySubscription(userId) {
   if (!pool || typeof userId !== "string" || !userId) {
     throw new Error("Invalid user ID");
@@ -90,28 +85,6 @@ export async function grantMonthlySubscription(userId) {
   );
 
   return result.rows[0];
-}
-
-async function fetchJSON(url) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 10000);
-
-  try {
-    const response = await fetch(url, {
-      signal: controller.signal,
-      headers: {
-        "User-Agent": "FPL-Risk-Calculator/1.0",
-      },
-    });
-
-    if (!response.ok) {
-      throw new Error(`HTTP ${response.status}`);
-    }
-
-    return await response.json();
-  } finally {
-    clearTimeout(timer);
-  }
 }
 
 export async function estimateRankImpact({

@@ -3,7 +3,7 @@
 // full 0/1/2/3 exposure distribution is preserved so distinct distributions
 // are not treated as identical merely because their means match.
 
-export const DECISION_EXPOSURE = Object.freeze({
+const DECISION_EXPOSURE = Object.freeze({
   dont_own: 0,
   own: 1,
   captain: 2,
@@ -16,10 +16,10 @@ export function decisionExposure({ owns, captain, tripleCaptain }) {
   }
   if (!owns && (captain || tripleCaptain)) throw new Error("Captain and triple captain require ownership");
   if (tripleCaptain && !captain) throw new Error("Triple captain requires captain selection");
-  if (!owns) return 0;
-  if (tripleCaptain) return 3;
-  if (captain) return 2;
-  return 1;
+  if (!owns) return DECISION_EXPOSURE.dont_own;
+  if (tripleCaptain) return DECISION_EXPOSURE.triple_captain;
+  if (captain) return DECISION_EXPOSURE.captain;
+  return DECISION_EXPOSURE.own;
 }
 
 export function exposureDistribution(rows, playerId) {
