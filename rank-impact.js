@@ -178,10 +178,18 @@ export async function estimateRankImpact({
     throw new Error("Snapshot tier is not in current sampling bands");
   }
 
+  if (gameweek <= 1) {
+    throw new Error(
+      "Rank impact is not available before Gameweek 2 (there is no prior gameweek to compare against)."
+    );
+  }
+
+  const referenceGameweek = gameweek - 1;
+
   const history = await fetchJSON(`${ENTRY_URL}${fplId}/history/`);
 
   const historyRow = (history.current || []).find(
-    row => Number(row.event) === gameweek
+    row => Number(row.event) === referenceGameweek
   );
 
   if (!historyRow) {
