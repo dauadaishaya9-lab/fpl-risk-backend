@@ -428,10 +428,10 @@ async function getClerkPrimaryEmail(userId) {
   });
   if (!response.ok) throw new Error("Clerk user lookup failed (" + response.status + ").");
   const user = await response.json();
-  const primaryId = user.primary_email_address_id;
-  const primary = Array.isArray(user.email_addresses) ? user.email_addresses.find(email => email.id === primaryId) : null;
-  if (!primary || !primary.email_address) throw new Error("No primary email address found.");
-  return primary.email_address;
+  const primaryId = user.primaryEmailAddressId;
+  const primary = Array.isArray(user.emailAddresses) ? user.emailAddresses.find(email => email.id === primaryId) : null;
+  if (!primary || !primary.emailAddress) throw new Error("No primary email address found.");
+  return primary.emailAddress;
 }
 
 async function addResendContact(email) {
