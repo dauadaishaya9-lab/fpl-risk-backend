@@ -219,13 +219,6 @@ export function estimateRankMovement({
     }
   }
 
-  console.log("DEBUG interpolate input:", {
-    projectedPoints,
-    nearby: observations
-      .filter(r => Math.abs(r.points - projectedPoints) < 5)
-      .map(r => ({ rank: r.rank, points: r.points }))
-  });
-
   const estimatedRank =
     interpolate(projectedPoints, observations) ?? currentRank;
 
