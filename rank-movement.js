@@ -93,6 +93,35 @@ export function deriveTierBoundaries(rows, tiers) {
     .filter(Boolean);
 }
 
+function buildLocalCurve(rows, currentRank) {
+  const multipliers = [3, 6, 10, Infinity];
+  let windowed = [];
+
+  for (const mult of multipliers) {
+    const lo = currentRank / mult;
+    const hi = currentRank * mult;
+    windowed = rows.filter(row => row.rank >= lo && row.rank <= hi);
+    if (windowed.length >= 20) break;
+  }
+
+  if (windowed.length < 2) windowed = rows;
+
+  const sorted = [...windowed].sort(
+    (a, b) => b.points - a.points || a.rank - b.rank
+  );
+
+  const clean = [];
+  let maxRankSoFar = -Infinity;
+  for (const row of sorted) {
+    if (row.rank >= maxRankSoFar) {
+      clean.push(row);
+      maxRankSoFar = row.rank;
+    }
+  }
+
+  return clean;
+}
+
 export function estimateRankMovement({
   currentRank,
   currentPoints,
@@ -223,8 +252,10 @@ export function estimateRankMovement({
     .filter(r => Math.abs(r.points - projectedPoints) < 5)
     .map(r => ({ rank: r.rank, points: r.points }));
 
+  const localCurve = buildLocalCurve(observations, currentRank);
+
   const estimatedRank =
-    interpolate(projectedPoints, observations) ?? currentRank;
+    interpolate(projectedPoints, localCurve) ?? currentRank;
 
   return {
     currentRank,
