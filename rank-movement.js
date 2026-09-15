@@ -219,19 +219,8 @@ export function estimateRankMovement({
     }
   }
 
-  const terminalRows = observations.filter(
-    row =>
-      row.rank >= finalTier.min &&
-      row.rank <= finalTier.max
-  );
-
-  const rankingRows =
-    terminalRows.length >= 2
-      ? terminalRows
-      : observations;
-
   const estimatedRank =
-    interpolate(projectedPoints, rankingRows) ?? currentRank;
+    interpolate(projectedPoints, observations) ?? currentRank;
 
   return {
     currentRank,
