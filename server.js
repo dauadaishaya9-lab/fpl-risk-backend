@@ -43,7 +43,9 @@ async function getSampleManagersForBand(band,totalManagers,season,gameweek) {
   const maxRank=band.max===Infinity?totalManagers:Math.min(band.max,totalManagers); if(maxRank<band.min)return [];
   const ranks=deterministicRanks(`${season}+${gameweek}+${band.name}`,band.min,maxRank,band.sampleSize);
   const pages=new Map();
-  for(const rank of ranks){ const page=standingsPageForRank(rank); if(pages.has(page))continue; try { const data=await getStandingsPage(page); pages.set(page,data.standings?.results||[]); } catch(error) { console.error(`Failed standings page ${page}:`,error.message); } }
+  const totalPages=new Set(ranks.map(standingsPageForRank)).size;
+  let pagesDone=0;
+  for(const rank of ranks){ const page=standingsPageForRank(rank); if(pages.has(page))continue; console.log(`  band ${band.name}: fetching standings page ${page} (${pagesDone+1}/${totalPages})...`); try { const data=await getStandingsPage(page); pages.set(page,data.standings?.results||[]); pagesDone++; console.log(`  band ${band.name}: page ${page} OK (${pagesDone}/${totalPages})`); } catch(error) { pagesDone++; console.error(`  band ${band.name}: page ${page} FAILED (${pagesDone}/${totalPages}):`,error.message); } }
   return ranks.map(requestedRank=>{ const page=standingsPageForRank(requestedRank); return pages.get(page)?.find(manager=>Number(manager.rank_sort)===requestedRank)||null; }).filter(Boolean);
 }
 async function getManagerPicks(managerId,gameweek){ return fetchJSON(`${ENTRY_URL}${managerId}/event/${gameweek}/picks/`,20000,{label:`manager ${managerId} GW ${gameweek} picks`}); }
