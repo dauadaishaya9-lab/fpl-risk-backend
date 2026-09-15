@@ -32,3 +32,65 @@ test("sampling is deterministic, bounded, and maps ranks to standings pages", ()
   assert.equal(standingsPageForRank(51), 2);
   assert.deepEqual(uniqueStandingPages([1, 50, 51, 100]), [1, 2]);
 });
+
+import { estimateRankMovement } from "../rank-movement.js";
+
+test("negative point swing produces negative rank movement and 'down' direction", () => {
+  const rows = [
+    { rank: 250001, points: 700 },
+    { rank: 254000, points: 696.8 },
+    { rank: 258000, points: 693.6 },
+    { rank: 262000, points: 690.4 },
+    { rank: 266000, points: 687.2 },
+    { rank: 270000, points: 684 }
+  ];
+  const tiers = [{ name: "250001-500000", min: 250001, max: 500000 }];
+
+  const movement = estimateRankMovement({
+    currentRank: 260000,
+    currentPoints: 692,
+    pointSwing: -8,
+    rows,
+    tiers
+  });
+
+  assert.equal(movement.direction, "down");
+  assert.ok(
+    movement.estimatedRankMovement < 0,
+    `expected negative estimatedRankMovement for a negative point swing, got ${movement.estimatedRankMovement}`
+  );
+  assert.ok(
+    movement.estimatedRank > movement.currentRank,
+    "a negative point swing should never produce a numerically better (lower) rank"
+  );
+});
+
+test("positive point swing produces positive rank movement and 'up' direction", () => {
+  const rows = [
+    { rank: 250001, points: 700 },
+    { rank: 254000, points: 696.8 },
+    { rank: 258000, points: 693.6 },
+    { rank: 262000, points: 690.4 },
+    { rank: 266000, points: 687.2 },
+    { rank: 270000, points: 684 }
+  ];
+  const tiers = [{ name: "250001-500000", min: 250001, max: 500000 }];
+
+  const movement = estimateRankMovement({
+    currentRank: 260000,
+    currentPoints: 692,
+    pointSwing: 8,
+    rows,
+    tiers
+  });
+
+  assert.equal(movement.direction, "up");
+  assert.ok(
+    movement.estimatedRankMovement > 0,
+    `expected positive estimatedRankMovement for a positive point swing, got ${movement.estimatedRankMovement}`
+  );
+  assert.ok(
+    movement.estimatedRank < movement.currentRank,
+    "a positive point swing should never produce a numerically worse (higher) rank"
+  );
+});
