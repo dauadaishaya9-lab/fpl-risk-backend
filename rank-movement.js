@@ -93,14 +93,8 @@ export function deriveTierBoundaries(rows, tiers) {
     .filter(Boolean);
 }
 
-function buildLocalCurve(rows, currentRank, neighborCount = 20) {
-  if (rows.length < 2) return rows;
-
-  const nearest = [...rows]
-    .sort((a, b) => Math.abs(a.rank - currentRank) - Math.abs(b.rank - currentRank))
-    .slice(0, Math.min(neighborCount, rows.length));
-
-  const sorted = [...nearest].sort(
+function cleanMonotonic(rows) {
+  const sorted = [...rows].sort(
     (a, b) => b.points - a.points || a.rank - b.rank
   );
 
@@ -114,6 +108,22 @@ function buildLocalCurve(rows, currentRank, neighborCount = 20) {
   }
 
   return clean;
+}
+
+function buildLocalCurve(rows, targetTier, currentRank, neighborCount = 20) {
+  if (rows.length < 2) return rows;
+
+  const scoped = targetTier
+    ? rows.filter(row => row.rank >= targetTier.min && row.rank <= targetTier.max)
+    : [];
+
+  if (scoped.length >= 2) return cleanMonotonic(scoped);
+
+  const nearest = [...rows]
+    .sort((a, b) => Math.abs(a.rank - currentRank) - Math.abs(b.rank - currentRank))
+    .slice(0, Math.min(neighborCount, rows.length));
+
+  return cleanMonotonic(nearest);
 }
 
 export function estimateRankMovement({
@@ -246,7 +256,7 @@ export function estimateRankMovement({
     .filter(r => Math.abs(r.points - projectedPoints) < 5)
     .map(r => ({ rank: r.rank, points: r.points }));
 
-  const localCurve = buildLocalCurve(observations, currentRank);
+  const localCurve = buildLocalCurve(observations, finalTier, currentRank);
 
   const estimatedRank =
     interpolate(projectedPoints, localCurve) ?? currentRank;
