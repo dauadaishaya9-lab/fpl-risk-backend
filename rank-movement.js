@@ -93,20 +93,14 @@ export function deriveTierBoundaries(rows, tiers) {
     .filter(Boolean);
 }
 
-function buildLocalCurve(rows, currentRank) {
-  const multipliers = [3, 6, 10, Infinity];
-  let windowed = [];
+function buildLocalCurve(rows, currentRank, neighborCount = 20) {
+  if (rows.length < 2) return rows;
 
-  for (const mult of multipliers) {
-    const lo = currentRank / mult;
-    const hi = currentRank * mult;
-    windowed = rows.filter(row => row.rank >= lo && row.rank <= hi);
-    if (windowed.length >= 20) break;
-  }
+  const nearest = [...rows]
+    .sort((a, b) => Math.abs(a.rank - currentRank) - Math.abs(b.rank - currentRank))
+    .slice(0, Math.min(neighborCount, rows.length));
 
-  if (windowed.length < 2) windowed = rows;
-
-  const sorted = [...windowed].sort(
+  const sorted = [...nearest].sort(
     (a, b) => b.points - a.points || a.rank - b.rank
   );
 
