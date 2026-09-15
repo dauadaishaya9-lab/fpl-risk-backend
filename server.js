@@ -85,7 +85,7 @@ async function saveGameweekSchedule(fplData){
   return true;
 }
 
-async function lockGameweekSamples(gameweek,fplData){
+export async function lockGameweekSamples(gameweek,fplData){
   const event=getEvent(fplData,gameweek);
   if(!event||!event.deadline_time)return false;
 
