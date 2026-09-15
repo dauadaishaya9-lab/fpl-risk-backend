@@ -137,8 +137,8 @@ async function lockGameweekSamples(gameweek,fplData){
 
     sampledManagers.push(...managers.map(manager=>({
       manager,
-      lockedRank:Number(manager.rank),
-      lockedTier:tierForRank(Number(manager.rank),totalManagers)?.name||null
+      lockedRank:Number(manager.rank_sort),
+      lockedTier:tierForRank(Number(manager.rank_sort),totalManagers)?.name||null
     })).filter(row=>row.lockedTier));
 
     completedBands++;
