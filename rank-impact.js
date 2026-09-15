@@ -272,6 +272,8 @@ export async function estimateRankImpact({
     },
 
     method:
-      "snapshot-observed score-to-rank interpolation with observed tier boundaries"
+      "snapshot-observed score-to-rank interpolation with observed tier boundaries",
+
+    debugNearby: movement.debugNearby
   };
 }

@@ -219,6 +219,10 @@ export function estimateRankMovement({
     }
   }
 
+  const debugNearby = observations
+    .filter(r => Math.abs(r.points - projectedPoints) < 5)
+    .map(r => ({ rank: r.rank, points: r.points }));
+
   const estimatedRank =
     interpolate(projectedPoints, observations) ?? currentRank;
 
@@ -238,6 +242,7 @@ export function estimateRankMovement({
     rankTier: currentTier.name,
     finalTier: finalTier.name,
     tiersCrossed,
-    boundaries
+    boundaries,
+    debugNearby
   };
 }
