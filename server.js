@@ -1,5 +1,5 @@
 import pg from "pg";
-import { deterministicRanks, standingsPageForRank, samplingBands, tierForRank } from "./sampling.js";
+import { deterministicRanks, standingsPageForRank, samplingBands, rankSamplingBands, tierForRank } from "./sampling.js";
 import { fetchJSON } from "./fpl-fetch.js";
 
 const { Pool } = pg;
@@ -52,7 +52,20 @@ async function getManagerPicks(managerId,gameweek){ return fetchJSON(`${ENTRY_UR
 
 async function initDatabase(){
   if(!pool)throw new Error("DATABASE_URL is not configured.");
-  await pool.query(`CREATE TABLE IF NOT EXISTS fpl_gameweeks (gameweek INTEGER PRIMARY KEY, season TEXT NOT NULL, deadline TIMESTAMPTZ NOT NULL, lock_time TIMESTAMPTZ NOT NULL, total_managers INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'pending', locked_at TIMESTAMPTZ, picks_captured_at TIMESTAMPTZ, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()); CREATE TABLE IF NOT EXISTS fpl_sample_managers (gameweek INTEGER NOT NULL REFERENCES fpl_gameweeks(gameweek) ON DELETE CASCADE, manager_id INTEGER NOT NULL, locked_rank INTEGER NOT NULL, locked_tier TEXT NOT NULL, manager_name TEXT, team_name TEXT, overall_points_at_lock INTEGER, picks JSONB, active_chip TEXT, captain INTEGER, triple_captain INTEGER, picks_captured_at TIMESTAMPTZ, pick_attempts INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(gameweek,manager_id)); ALTER TABLE fpl_sample_managers ADD COLUMN IF NOT EXISTS pick_attempts INTEGER NOT NULL DEFAULT 0; CREATE INDEX IF NOT EXISTS idx_sample_managers_gameweek_tier ON fpl_sample_managers(gameweek,locked_tier); CREATE INDEX IF NOT EXISTS idx_gameweeks_status_deadline ON fpl_gameweeks(status,deadline);`);
+  await pool.query(`CREATE TABLE IF NOT EXISTS fpl_gameweeks (gameweek INTEGER PRIMARY KEY, season TEXT NOT NULL, deadline TIMESTAMPTZ NOT NULL, lock_time TIMESTAMPTZ NOT NULL, total_managers INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'pending', locked_at TIMESTAMPTZ, picks_captured_at TIMESTAMPTZ, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()); CREATE TABLE IF NOT EXISTS fpl_sample_managers (gameweek INTEGER NOT NULL REFERENCES fpl_gameweeks(gameweek) ON DELETE CASCADE, manager_id INTEGER NOT NULL, locked_rank INTEGER NOT NULL, locked_tier TEXT NOT NULL, manager_name TEXT, team_name TEXT, overall_points_at_lock INTEGER, picks JSONB, active_chip TEXT, captain INTEGER, triple_captain INTEGER, picks_captured_at TIMESTAMPTZ, pick_attempts INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(gameweek,manager_id)); ALTER TABLE fpl_sample_managers ADD COLUMN IF NOT EXISTS pick_attempts INTEGER NOT NULL DEFAULT 0; CREATE INDEX IF NOT EXISTS idx_sample_managers_gameweek_tier ON fpl_sample_managers(gameweek,locked_tier); CREATE INDEX IF NOT EXISTS idx_gameweeks_status_deadline ON fpl_gameweeks(status,deadline);
+
+    CREATE TABLE IF NOT EXISTS fpl_rank_sample_managers (
+      gameweek INTEGER NOT NULL,
+      manager_id INTEGER NOT NULL,
+      locked_rank INTEGER NOT NULL,
+      locked_tier TEXT NOT NULL,
+      overall_points_at_lock INTEGER NOT NULL,
+      captured_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      PRIMARY KEY(gameweek, manager_id)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_rank_sample_managers_gameweek_tier
+      ON fpl_rank_sample_managers(gameweek, locked_tier);`);
   await pool.query(`CREATE TABLE IF NOT EXISTS fpl_season_state (id INTEGER PRIMARY KEY CHECK (id=1), season TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'active', last_gw1_deadline TIMESTAMPTZ, gw38_completed_at TIMESTAMPTZ, updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`);
 }
 async function saveGameweekSchedule(fplData){
@@ -472,7 +485,14 @@ WHERE gameweek=$1
 ORDER BY COALESCE(picks_captured_at,deadline) ASC`,[currentGameweek])
       : {rows:[]};
     for(const row of locked.rows){
-      try{await captureGameweekPicks(row.gameweek);}catch(error){console.error(`GW ${row.gameweek} PICK CAPTURE FAILED:`,error.message);}
+      try{
+        await captureGameweekPicks(row.gameweek);
+        try {
+          await lockRankSamples(row.gameweek, fplData);
+        } catch (rankError) {
+          console.error(`GW ${row.gameweek} RANK SAMPLE FAILED:`, rankError.message);
+        }
+      }catch(error){console.error(`GW ${row.gameweek} PICK CAPTURE FAILED:`,error.message);}
     }
     runtime.lastSuccessfulRefresh=new Date().toISOString();
     runtime.lastError=null;
@@ -485,6 +505,67 @@ ORDER BY COALESCE(picks_captured_at,deadline) ASC`,[currentGameweek])
   }
 }
 export function startScheduler(){ if(schedulerStarted||!pool)return; schedulerStarted=true; refreshScheduler().catch(error=>console.error("BACKGROUND SCHEDULER FAILED:",error.message)); }
+
+export async function lockRankSamples(gameweek, fplData) {
+  const event = getEvent(fplData, gameweek);
+  if (!event || !event.deadline_time) return false;
+
+  const totalManagers = Number(fplData.total_players);
+  if (!Number.isFinite(totalManagers) || totalManagers <= 0) {
+    throw new Error("FPL total manager count is unavailable.");
+  }
+
+  const bands = rankSamplingBands(totalManagers);
+  const season = getSeasonLabel();
+  const sampledRows = [];
+  let completedBands = 0;
+
+  for (const band of bands) {
+    const managers = await getSampleManagersForBand(band, totalManagers, season, gameweek);
+
+    if (managers.length < band.sampleSize) {
+      console.log(`RANK SAMPLE GW ${gameweek} band ${band.name}: only found ${managers.length}/${band.sampleSize}. Skipping band.`);
+      continue;
+    }
+
+    for (const manager of managers) {
+      const lockedRank = Number(manager.rank_sort);
+      const lockedTier = tierForRank(lockedRank, totalManagers)?.name || null;
+      if (!lockedTier) continue;
+      sampledRows.push({
+        managerId: Number(manager.entry),
+        lockedRank,
+        lockedTier,
+        points: Number(manager.total) || 0
+      });
+    }
+
+    completedBands++;
+    console.log(`RANK SAMPLE GW ${gameweek} band ${band.name}: sampled ${managers.length}/${band.sampleSize} managers`);
+  }
+
+  if (completedBands === 0) {
+    console.log(`RANK SAMPLE GW ${gameweek}: no band had enough managers; aborting.`);
+    return false;
+  }
+
+  for (const row of sampledRows) {
+    await pool.query(
+      `INSERT INTO fpl_rank_sample_managers (gameweek, manager_id, locked_rank, locked_tier, overall_points_at_lock, captured_at)
+       VALUES ($1,$2,$3,$4,$5,NOW())
+       ON CONFLICT (gameweek, manager_id) DO UPDATE SET
+         locked_rank=EXCLUDED.locked_rank, locked_tier=EXCLUDED.locked_tier,
+         overall_points_at_lock=EXCLUDED.overall_points_at_lock, captured_at=NOW()`,
+      [gameweek, row.managerId, row.lockedRank, row.lockedTier, row.points]
+    );
+  }
+
+  // Self-destruct: once this gameweek's rank sample is in, older gameweeks' rank samples are no longer needed.
+  await pool.query(`DELETE FROM fpl_rank_sample_managers WHERE gameweek <> $1`, [gameweek]);
+
+  console.log(`RANK SAMPLE GW ${gameweek}: stored ${sampledRows.length} managers; older gameweeks' rank samples cleared.`);
+  return true;
+}
 
 async function relabelMismatchedTiers(){
   if(!pool)return;
