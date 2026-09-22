@@ -58,6 +58,39 @@ export function samplingBands(totalManagers) {
   return bands;
 }
 
+const RANK_FIXED_BANDS = [
+  { name:"1-10000", min:1, max:10000, sampleSize:40 },
+  { name:"10001-50000", min:10001, max:50000, sampleSize:60 },
+  { name:"50001-100000", min:50001, max:100000, sampleSize:80 },
+  { name:"100001-250000", min:100001, max:250000, sampleSize:100 },
+  { name:"250001-500000", min:250001, max:500000, sampleSize:120 },
+  { name:"500001-1000000", min:500001, max:1000000, sampleSize:140 }
+];
+
+const RANK_MILLION_BAND_SAMPLE_SIZE = 120;
+
+// Separate, denser sampling plan used ONLY for the rank estimator.
+// Standings-only (no picks fetch), so this never adds load to the
+// more expensive per-manager picks-fetch pipeline.
+export function rankSamplingBands(totalManagers) {
+  const total = Math.max(0, Math.floor(Number(totalManagers)||0));
+  const bands = RANK_FIXED_BANDS.map(b => ({...b}));
+
+  if (total >= MILLION_BAND_START) {
+    for (let min=MILLION_BAND_START; min<=total; min+=MILLION_BAND_SIZE) {
+      const max=Math.min(min+MILLION_BAND_SIZE-1,total);
+      bands.push({
+        name:`${min}-${max}`,
+        min,
+        max,
+        sampleSize:Math.min(RANK_MILLION_BAND_SAMPLE_SIZE,max-min+1)
+      });
+    }
+  }
+
+  return bands;
+}
+
 export function tierForRank(rank,totalManagers) {
   return samplingBands(totalManagers).find(
     tier => rank>=tier.min && rank<=tier.max
