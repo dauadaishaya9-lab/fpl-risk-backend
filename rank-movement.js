@@ -252,10 +252,6 @@ export function estimateRankMovement({
     }
   }
 
-  const debugNearby = observations
-    .filter(r => Math.abs(r.points - projectedPoints) < 5)
-    .map(r => ({ rank: r.rank, points: r.points }));
-
   const localCurve = buildLocalCurve(observations, finalTier, currentRank);
 
   const estimatedRank =
@@ -277,7 +273,6 @@ export function estimateRankMovement({
     rankTier: currentTier.name,
     finalTier: finalTier.name,
     tiersCrossed,
-    boundaries,
-    debugNearby
+    boundaries
   };
 }
