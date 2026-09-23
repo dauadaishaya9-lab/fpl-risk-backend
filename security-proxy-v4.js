@@ -375,7 +375,7 @@ const gateway = http.createServer(async (req, res) => {
       }
     }
 
-    if (url.pathname === "/internal/manual-lock-rank-gw5") {
+    if (url.pathname === "/api/internal/manual-lock-rank-gw5") {
       if (req.headers["x-manual-secret"] !== process.env.MANUAL_TRIGGER_SECRET) {
         return json(res, 403, { error: "Forbidden" }, responseCors);
       }
