@@ -375,6 +375,19 @@ const gateway = http.createServer(async (req, res) => {
       }
     }
 
+    if (url.pathname === "/internal/manual-lock-rank-gw5") {
+      if (req.headers["x-manual-secret"] !== process.env.MANUAL_TRIGGER_SECRET) {
+        return json(res, 403, { error: "Forbidden" }, responseCors);
+      }
+      try {
+        const fplData = await (await fetch("https://fantasy.premierleague.com/api/bootstrap-static/")).json();
+        const result = await backendModule.lockRankSamples(5, fplData);
+        return json(res, 200, { result }, responseCors);
+      } catch (error) {
+        return json(res, 500, { error: error.message }, responseCors);
+      }
+    }
+
     if (url.pathname === "/api/premium/notify") {
       if (req.method !== "POST") return json(res, 405, { error: "Method not allowed" }, { ...responseCors, Allow: "POST,OPTIONS" });
       try {
