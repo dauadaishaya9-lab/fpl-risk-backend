@@ -281,18 +281,6 @@ const gateway = http.createServer(async (req, res) => {
         scheduler: schedulerHealth
       }, responseCors);
     }
-    if (url.pathname === "/api/internal/manual-lock-rank-gw5") {
-      if (req.headers["x-manual-secret"] !== process.env.MANUAL_TRIGGER_SECRET) {
-        return json(res, 403, { error: "Forbidden" }, responseCors);
-      }
-      try {
-        const fplData = await (await fetch("https://fantasy.premierleague.com/api/bootstrap-static/")).json();
-        const result = await backendModule.lockRankSamples(5, fplData);
-        return json(res, 200, { result }, responseCors);
-      } catch (error) {
-        return json(res, 500, { error: error.message }, responseCors);
-      }
-    }
     if (!url.pathname.startsWith("/api/")) return json(res, 404, { error: "Not found" }, responseCors);
     if (!backendReady) return json(res, 503, { error: "Backend is starting." }, { ...responseCors, "Retry-After": "3" });
 
