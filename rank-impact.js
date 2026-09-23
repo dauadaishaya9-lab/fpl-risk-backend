@@ -182,21 +182,21 @@ export async function estimateRankImpact({
 
   /*
    * IMPORTANT:
-   * We intentionally read ALL successfully captured managers
-   * from the snapshot instead of restricting observations to the
-   * user's exposure tier.
-   *
-   * This allows rank-movement.js to derive observed boundaries
-   * between the current production sampling tiers.
+   * This reads from fpl_rank_sample_managers, a separate, denser,
+   * standings-only sample used ONLY for rank estimation (never
+   * used for ownership/exposure, which stays on fpl_sample_managers).
+   * We intentionally read ALL successfully captured managers from
+   * the snapshot instead of restricting observations to the user's
+   * tier, so rank-movement.js can derive observed boundaries between
+   * the current production sampling tiers.
    */
   const result = await pool.query(
     `
       SELECT
         locked_rank,
         overall_points_at_lock
-      FROM fpl_sample_managers
+      FROM fpl_rank_sample_managers
       WHERE gameweek = $1
-        AND picks IS NOT NULL
         AND overall_points_at_lock IS NOT NULL
         AND locked_rank IS NOT NULL
       ORDER BY locked_rank ASC
