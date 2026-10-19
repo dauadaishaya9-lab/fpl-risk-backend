@@ -400,50 +400,28 @@ export function getSchedulerHealth(){
 async function scheduleNextRun(currentGameweek){
   if(!pool||!schedulerStarted)return;
   clearSchedulerTimer();
+  const fallbackMs=15*60*1000;
+  let delay=fallbackMs;
+  let reason="regular 15-minute check";
   try{
-    if(!Number.isFinite(Number(currentGameweek)))return;
-    const result=await pool.query(`SELECT gameweek,status,lock_time,deadline,picks_captured_at,
-CASE
-  WHEN status='pending' AND deadline <= NOW() THEN NOW() + INTERVAL '15 minutes'
-  WHEN status='pending' THEN lock_time
-  WHEN picks_captured_at IS NULL THEN deadline
-  ELSE GREATEST(
-    picks_captured_at + INTERVAL '7 days',
-    NOW() + INTERVAL '15 minutes'
-  )
-  END AS run_at
-FROM fpl_gameweeks
-WHERE gameweek=$1
-  AND (
-    (status='pending' AND deadline > NOW())
-    OR
-    (status='pending' AND deadline <= NOW())
-    OR
-    (status='locked' AND deadline <= NOW() AND picks_captured_at IS NULL)
-    OR
-    (status='complete' AND picks_captured_at IS NOT NULL
-      AND picks_captured_at + INTERVAL '7 days' <= NOW())
-  )
-ORDER BY
-  CASE
-    WHEN status='pending' AND deadline <= NOW() THEN 0
-    ELSE 1
-  END,
-  run_at ASC
-LIMIT 1`,[Number(currentGameweek)]);
-    if(!result.rowCount)return;
-    const row=result.rows[0];
-    const target=new Date(row.run_at).getTime();
-    const now=Date.now();
-    const delay=Math.max(1000,Math.min(target-now,2147483647));
-    const scheduledAt=new Date(now+delay);
-    runtime.nextScheduledRun=scheduledAt.toISOString();
-    console.log(`SCHEDULER: next GW ${row.gameweek} ${row.status} run scheduled for ${scheduledAt.toISOString()}`);
-    schedulerTimer=setTimeout(()=>{schedulerTimer=null;refreshScheduler().catch(error=>console.error("BACKGROUND SCHEDULER FAILED:",error.message));},delay);
+    const result=await pool.query(`SELECT MIN(run_at) AS run_at FROM (
+SELECT lock_time AS run_at FROM fpl_gameweeks WHERE status='pending' AND lock_time > NOW()
+UNION ALL
+SELECT deadline AS run_at FROM fpl_gameweeks WHERE status='locked' AND picks_captured_at IS NULL AND deadline > NOW()
+) due`);
+    const nextDue=result.rows[0]?.run_at;
+    if(nextDue){
+      const untilDue=new Date(nextDue).getTime()-Date.now();
+      if(untilDue<delay){delay=Math.max(1000,untilDue);reason="next lock or pick capture";}
+    }
   }catch(error){
     runtime.lastError=error.message;
     console.error("SCHEDULER NEXT-RUN CALCULATION FAILED:",error.message);
   }
+  const scheduledAt=new Date(Date.now()+delay);
+  runtime.nextScheduledRun=scheduledAt.toISOString();
+  console.log(`SCHEDULER: next run (${reason}) scheduled for ${scheduledAt.toISOString()}`);
+  schedulerTimer=setTimeout(()=>{schedulerTimer=null;refreshScheduler().catch(error=>console.error("BACKGROUND SCHEDULER FAILED:",error.message));},delay);
 }
 async function ensureRankSample(gameweek, fplData){
   const countSql = "SELECT COUNT(*)::int AS manager_count FROM fpl_rank_sample_managers WHERE gameweek=$1";
