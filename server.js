@@ -445,6 +445,18 @@ LIMIT 1`,[Number(currentGameweek)]);
     console.error("SCHEDULER NEXT-RUN CALCULATION FAILED:",error.message);
   }
 }
+async function ensureRankSample(gameweek, fplData){
+  const countSql = "SELECT COUNT(*)::int AS manager_count FROM fpl_rank_sample_managers WHERE gameweek=$1";
+  const before = await pool.query(countSql, [gameweek]);
+  if (Number(before.rows[0]?.manager_count || 0) > 0) return true;
+  try {
+    await lockRankSamples(gameweek, fplData);
+  } catch (error) {
+    console.error(`GW ${gameweek} RANK SAMPLE FAILED:`, error.message);
+  }
+  const after = await pool.query(countSql, [gameweek]);
+  return Number(after.rows[0]?.manager_count || 0) > 0;
+}
 export async function refreshScheduler(){
   if(runtime.refreshing||!pool)return;
   runtime.refreshing=true;
@@ -468,6 +480,15 @@ export async function refreshScheduler(){
         }catch(error){
           console.error(`GW ${event.id} LOCK FAILED:`,error.message);
         }
+        if(Date.now()<deadline.getTime()){
+          try{
+            const rankReady=await ensureRankSample(event.id,fplData);
+            runtime.rankRetryDeadline=rankReady?null:deadline.getTime();
+          }catch(error){
+            runtime.rankRetryDeadline=deadline.getTime();
+            console.error(`GW ${event.id} RANK CHECK FAILED:`,error.message);
+          }
+        }
       }
     }
     const currentGameweek=Number(currentEvent?.id);
@@ -487,11 +508,6 @@ ORDER BY COALESCE(picks_captured_at,deadline) ASC`,[currentGameweek])
     for(const row of locked.rows){
       try{
         await captureGameweekPicks(row.gameweek);
-        try {
-          await lockRankSamples(row.gameweek, fplData);
-        } catch (rankError) {
-          console.error(`GW ${row.gameweek} RANK SAMPLE FAILED:`, rankError.message);
-        }
       }catch(error){console.error(`GW ${row.gameweek} PICK CAPTURE FAILED:`,error.message);}
     }
     runtime.lastSuccessfulRefresh=new Date().toISOString();
@@ -502,6 +518,14 @@ ORDER BY COALESCE(picks_captured_at,deadline) ASC`,[currentGameweek])
   }finally{
     runtime.refreshing=false;
     await scheduleNextRun(currentEvent?.id);
+    if(runtime.rankRetryDeadline&&Date.now()<runtime.rankRetryDeadline-2000){
+      const retryDelay=Math.max(1000,Math.min(10*60*1000,runtime.rankRetryDeadline-Date.now()-1000));
+      clearSchedulerTimer();
+      const retryAt=new Date(Date.now()+retryDelay);
+      runtime.nextScheduledRun=retryAt.toISOString();
+      console.log(`SCHEDULER: rank sample still missing; retrying at ${retryAt.toISOString()}`);
+      schedulerTimer=setTimeout(()=>{schedulerTimer=null;refreshScheduler().catch(error=>console.error("BACKGROUND SCHEDULER FAILED:",error.message));},retryDelay);
+    }
   }
 }
 export function startScheduler(){ if(schedulerStarted||!pool)return; schedulerStarted=true; refreshScheduler().catch(error=>console.error("BACKGROUND SCHEDULER FAILED:",error.message)); }
@@ -509,6 +533,10 @@ export function startScheduler(){ if(schedulerStarted||!pool)return; schedulerSt
 export async function lockRankSamples(gameweek, fplData) {
   const event = getEvent(fplData, gameweek);
   if (!event || !event.deadline_time) return false;
+  if (Date.now() >= new Date(event.deadline_time).getTime()) {
+    console.log(`RANK SAMPLE GW ${gameweek}: deadline has passed; refusing to lock so after-deadline points are never saved.`);
+    return false;
+  }
 
   const totalManagers = Number(fplData.total_players);
   if (!Number.isFinite(totalManagers) || totalManagers <= 0) {
